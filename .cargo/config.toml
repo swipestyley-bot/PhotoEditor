@@ -1,0 +1,15 @@
+# Cargo configuration for the project.
+#
+# `ort` runs in load-dynamic mode: ONNX Runtime is loaded from onnxruntime.dll
+# at runtime (not statically linked). This [env] block points `ort` at the
+# bundled DLL automatically for any cargo-driven dev run — `cargo build`,
+# `cargo test`, `cargo run`, and `cargo tauri dev` — so you never have to set
+# ORT_DYLIB_PATH by hand.
+#
+# The DLL is not committed; fetch it once with:
+#   pwsh scripts/fetch-onnxruntime.ps1
+#
+# `relative = true` resolves the path against this project root (the parent of
+# the .cargo directory), so it works on any clone without editing.
+[env]
+ORT_DYLIB_PATH = { value = "runtime/onnxruntime.dll", relative = true, force = true }

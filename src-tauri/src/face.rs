@@ -339,6 +339,23 @@ mod tests {
         assert!(classify_eyes(&[Point { x: 0.0, y: 0.0 }; 10], DEFAULT_EAR_THRESHOLD).is_err());
     }
 
+    /// Confirms the ONNX Runtime dylib (onnxruntime.dll) loads via the
+    /// ORT_DYLIB_PATH wired up in `.cargo/config.toml`. This does NOT run
+    /// inference — it forces `ort` to dlopen the runtime and read its version
+    /// string, proving the dynamic-loading setup works end-to-end. If the DLL
+    /// is missing or the wrong version, `ort::info()` panics with the reason.
+    #[test]
+    fn onnxruntime_dylib_loads() {
+        let dylib = std::env::var("ORT_DYLIB_PATH").unwrap_or_else(|_| "<unset>".into());
+        println!("ORT_DYLIB_PATH = {dylib}");
+        let info = ort::info();
+        println!("ONNX Runtime build info: {info}");
+        assert!(
+            info.contains("ORT") || !info.is_empty(),
+            "ort::info() returned nothing; the dylib did not load"
+        );
+    }
+
     /// End-to-end ONNX inference against a real model + face image. Ignored by
     /// default (no model/photo in the test set yet). To enable:
     ///

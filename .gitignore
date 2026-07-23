@@ -12,6 +12,10 @@ dist
 dist-ssr
 *.local
 
+# Native runtime + ML models — fetched by scripts, not committed (large binaries)
+/runtime/
+/models/
+
 # Editor directories and files
 .vscode/*
 !.vscode/extensions.json
