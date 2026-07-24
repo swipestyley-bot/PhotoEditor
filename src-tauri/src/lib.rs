@@ -33,9 +33,8 @@ pub fn run() {
             dedup::find_duplicate_clusters,
             library::analyze_library,
             library::analyze_files,
-            library::export_kept,
+            library::export_selects,
             library::preview_edit,
-            library::batch_edit,
             library::large_preview
         ])
         .run(tauri::generate_context!())

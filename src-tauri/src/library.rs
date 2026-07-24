@@ -6,13 +6,15 @@
 //! frame), eyes-closed state, and duplicate / burst grouping. This is the
 //! `analyze_folder` example's logic behind a Tauri command, plus thumbnails.
 
+use std::collections::HashMap;
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use base64::Engine as _;
 use image::codecs::jpeg::JpegEncoder;
 use image::{DynamicImage, ExtendedColorType, ImageEncoder, ImageFormat};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::dedup::{
     cluster_by_similarity, exif_timestamp, group_bursts, perceptual_hash, Fingerprint,
@@ -304,45 +306,48 @@ pub struct ExportResult {
     pub errors: Vec<String>,
 }
 
-/// Export the given source files into `dest` (a folder), leaving originals in
-/// place. When `edit` is present (and not a no-op) each photo is decoded,
-/// auto-corrected, and written as a JPEG; otherwise the original file is copied
-/// byte-for-byte. Names that would collide get a ` (n)` suffix, so nothing is
-/// overwritten. Backs the "Export Selects" action (item 7: corrected or original).
+/// One select to export: its file path and the per-photo edit settings.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExportItem {
+    pub path: String,
+    pub params: crate::edit::EditParams,
+}
+
+/// Export selects into `dest`, leaving originals in place. When `corrected` is
+/// true, each photo is decoded, its own edit settings applied, and written as a
+/// JPEG; otherwise the original file is copied byte-for-byte. Names that would
+/// collide get a ` (n)` suffix, so nothing is overwritten.
 #[tauri::command]
-pub fn export_kept(
-    paths: Vec<String>,
+pub fn export_selects(
+    items: Vec<ExportItem>,
     dest: String,
-    edit: Option<crate::edit::EditParams>,
+    corrected: bool,
 ) -> Result<ExportResult, String> {
     let dest_dir = PathBuf::from(&dest);
     if !dest_dir.is_dir() {
         return Err(format!("destination is not a folder: {dest}"));
     }
-    let apply = edit.filter(|e| !e.is_noop());
     let mut copied = 0;
     let mut errors = Vec::new();
-    for p in &paths {
-        let src = Path::new(p);
+    for item in &items {
+        let src = Path::new(&item.path);
         let Some(stem) = src.file_stem() else {
-            errors.push(format!("skipped (no file name): {p}"));
+            errors.push(format!("skipped (no file name): {}", item.path));
             continue;
         };
-        let result = match &apply {
+        let result = if corrected && !item.params.is_noop() {
             // Edited exports are re-encoded as JPEG regardless of input format.
-            Some(params) => {
-                let target = unique_in(&dest_dir, &format!("{}.jpg", stem.to_string_lossy()));
-                decode_image(src)
-                    .map(|img| crate::edit::auto_edit(&img, *params))
-                    .and_then(|edited| save_jpeg(&edited, &target))
-            }
-            None => {
-                let name = src.file_name().unwrap_or(stem).to_string_lossy().to_string();
-                let target = unique_in(&dest_dir, &name);
-                std::fs::copy(src, &target)
-                    .map(|_| ())
-                    .map_err(|e| format!("{}: {e}", src.display()))
-            }
+            let target = unique_in(&dest_dir, &format!("{}.jpg", stem.to_string_lossy()));
+            decode_image(src)
+                .map(|img| crate::edit::auto_edit(&img, item.params))
+                .and_then(|edited| save_jpeg(&edited, &target))
+        } else {
+            let name = src.file_name().unwrap_or(stem).to_string_lossy().to_string();
+            let target = unique_in(&dest_dir, &name);
+            std::fs::copy(src, &target)
+                .map(|_| ())
+                .map_err(|e| format!("{}: {e}", src.display()))
         };
         match result {
             Ok(()) => copied += 1,
@@ -399,40 +404,29 @@ pub struct PreviewPair {
     pub after: String,
 }
 
-/// Render a before/after auto-edit preview for a single photo (item 5).
+/// Cache of decoded preview-size originals (+ their encoded "before" data URI),
+/// keyed by path, so dragging a slider re-renders without re-reading the file.
+fn preview_cache() -> &'static Mutex<HashMap<String, (Arc<DynamicImage>, String)>> {
+    static CACHE: OnceLock<Mutex<HashMap<String, (Arc<DynamicImage>, String)>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Render a before/after edit preview for a single photo at preview size. The
+/// decoded preview image is cached per path, so real-time slider drags only pay
+/// for the edit + JPEG encode, not a fresh decode from disk.
 #[tauri::command]
 pub fn preview_edit(path: String, params: crate::edit::EditParams) -> Result<PreviewPair, String> {
-    let img = decode_image(Path::new(&path))?;
-    let small = img.thumbnail(PREVIEW_MAX, PREVIEW_MAX);
-    let before = encode_jpeg_data_uri(&small)?;
-    let after = encode_jpeg_data_uri(&crate::edit::auto_edit(&small, params))?;
+    let (img, before) = {
+        let mut cache = preview_cache().lock().map_err(|e| format!("cache lock: {e}"))?;
+        if let Some((img, before)) = cache.get(&path) {
+            (img.clone(), before.clone())
+        } else {
+            let small = Arc::new(decode_image(Path::new(&path))?.thumbnail(PREVIEW_MAX, PREVIEW_MAX));
+            let before = encode_jpeg_data_uri(&small)?;
+            cache.insert(path.clone(), (small.clone(), before.clone()));
+            (small, before)
+        }
+    };
+    let after = encode_jpeg_data_uri(&crate::edit::auto_edit(&img, params))?;
     Ok(PreviewPair { before, after })
-}
-
-/// A corrected *grid* thumbnail for one photo.
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct EditedThumb {
-    pub path: String,
-    pub thumbnail: String,
-}
-
-/// Apply `params` to each photo and return corrected grid thumbnails, so the
-/// grid can show the edit across all selects at once (item 6). Display-only —
-/// the full-resolution edit happens at export time.
-#[tauri::command]
-pub fn batch_edit(
-    paths: Vec<String>,
-    params: crate::edit::EditParams,
-) -> Result<Vec<EditedThumb>, String> {
-    let mut out = Vec::with_capacity(paths.len());
-    for p in &paths {
-        let img = decode_image(Path::new(p))?;
-        let edited = crate::edit::auto_edit(&img.thumbnail(THUMB_MAX, THUMB_MAX), params);
-        out.push(EditedThumb {
-            path: p.clone(),
-            thumbnail: encode_jpeg_data_uri(&edited)?,
-        });
-    }
-    Ok(out)
 }

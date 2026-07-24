@@ -18,6 +18,8 @@ dist-ssr
 
 # Generated diagnostic output (face-region crops from examples/dump_face_crops)
 /face-crops/
+# Generated auto-edit before/after samples (examples/edit_probe)
+/edit-samples/
 
 # Editor directories and files
 .vscode/*

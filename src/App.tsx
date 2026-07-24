@@ -42,36 +42,73 @@ interface ExportResult {
 }
 
 interface EditParams {
+  autoExposure: number;
+  autoWhiteBalance: number;
+  autoContrast: number;
   exposure: number;
-  whiteBalance: number;
   contrast: number;
+  highlights: number;
+  shadows: number;
+  whites: number;
+  blacks: number;
+  saturation: number;
+  vibrance: number;
+  temperature: number;
+  tint: number;
+  sharpening: number;
+  straighten: number;
 }
 
-const DEFAULT_EDIT: EditParams = { exposure: 100, whiteBalance: 100, contrast: 100 };
+const DEFAULT_EDIT: EditParams = {
+  autoExposure: 0, autoWhiteBalance: 0, autoContrast: 0,
+  exposure: 0, contrast: 0, highlights: 0, shadows: 0, whites: 0, blacks: 0,
+  saturation: 0, vibrance: 0, temperature: 0, tint: 0, sharpening: 0, straighten: 0,
+};
+
+type SliderCfg = { key: keyof EditParams; label: string; min: number; max: number };
+const ADJUST_GROUPS: { title: string; sliders: SliderCfg[] }[] = [
+  { title: "Auto", sliders: [
+    { key: "autoExposure", label: "Auto Exposure", min: 0, max: 100 },
+    { key: "autoWhiteBalance", label: "Auto White Bal.", min: 0, max: 100 },
+    { key: "autoContrast", label: "Auto Contrast", min: 0, max: 100 },
+  ] },
+  { title: "Light", sliders: [
+    { key: "exposure", label: "Exposure", min: -100, max: 100 },
+    { key: "contrast", label: "Contrast", min: -100, max: 100 },
+    { key: "highlights", label: "Highlights", min: -100, max: 100 },
+    { key: "shadows", label: "Shadows", min: -100, max: 100 },
+    { key: "whites", label: "Whites", min: -100, max: 100 },
+    { key: "blacks", label: "Blacks", min: -100, max: 100 },
+  ] },
+  { title: "Color", sliders: [
+    { key: "temperature", label: "Temperature", min: -100, max: 100 },
+    { key: "tint", label: "Tint", min: -100, max: 100 },
+    { key: "vibrance", label: "Vibrance", min: -100, max: 100 },
+    { key: "saturation", label: "Saturation", min: -100, max: 100 },
+  ] },
+  { title: "Detail", sliders: [
+    { key: "sharpening", label: "Sharpening", min: 0, max: 100 },
+  ] },
+  { title: "Geometry", sliders: [
+    { key: "straighten", label: "Straighten", min: -100, max: 100 },
+  ] },
+];
 
 type Decision = "keep" | "reject";
-
-type FilterKind =
-  | "all"
-  | "blurry"
-  | "eyes"
-  | "duplicates"
-  | "keepers"
-  | "rejects"
-  | "cluster"
-  | "burst";
-
-interface Filter {
-  kind: FilterKind;
-  id?: number;
-}
+type FilterKind = "all" | "blurry" | "eyes" | "duplicates" | "keepers" | "rejects";
 
 const IMAGE_EXTENSIONS = [
   "jpg", "jpeg", "png", "tif", "tiff", "webp", "bmp",
   "cr2", "cr3", "nef", "arw", "dng", "raf", "rw2", "orf", "pef", "srw",
 ];
 
-/** The AI labels for a single photo (shown in the reviewer & grid). */
+function eyesVerdict(e: EyesInfo | null): string {
+  if (!e) return "no face";
+  if (e.bothClosed) return "both closed";
+  if (e.anyClosed) return "one closed";
+  return "open";
+}
+
 function photoLabels(p: Photo): { text: string; cls: string }[] {
   const out: { text: string; cls: string }[] = [];
   if (p.isBlurry) out.push({ text: "Blurry", cls: "blur" });
@@ -86,38 +123,39 @@ export default function App() {
   const [report, setReport] = useState<FolderReport | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [exportMsg, setExportMsg] = useState<string | null>(null);
+  const [status, setStatus] = useState<string | null>(null);
 
-  // Culling state
+  // culling
   const [decisions, setDecisions] = useState<Record<string, Decision>>({});
-  const [filter, setFilter] = useState<Filter>({ kind: "all" });
+  const [filter, setFilter] = useState<FilterKind>("all");
   const [focusIdx, setFocusIdx] = useState(0);
-  const [reviewIdx, setReviewIdx] = useState<number | null>(null);
+  const [loupe, setLoupe] = useState(false);
   const [namingOpen, setNamingOpen] = useState(false);
   const [project, setProject] = useState<string | null>(null);
 
-  // Editing state
-  const [editParams, setEditParams] = useState<EditParams>(DEFAULT_EDIT);
-  const [editedThumbs, setEditedThumbs] = useState<Record<string, string>>({});
+  // editing (per-photo settings)
+  const [settings, setSettings] = useState<Record<string, EditParams>>({});
   const [exportCorrected, setExportCorrected] = useState(true);
-  const [batchBusy, setBatchBusy] = useState(false);
-  const [editSelected, setEditSelected] = useState<Photo | null>(null);
+  const [editPath, setEditPath] = useState<string | null>(null);
+  const [comparing, setComparing] = useState(false);
 
   async function runAnalysis(command: string, args: Record<string, unknown>) {
     setLoading(true);
     setError(null);
-    setExportMsg(null);
+    setStatus(null);
     setReport(null);
     setDecisions({});
-    setFilter({ kind: "all" });
+    setFilter("all");
     setFocusIdx(0);
-    setReviewIdx(null);
-    setEditedThumbs({});
+    setLoupe(false);
+    setSettings({});
+    setComparing(false);
     setMode("cull");
     setProject(null);
     try {
       const r = await invoke<FolderReport>(command, args);
       setReport(r);
+      setStatus(`Loaded ${r.photos.length} photos.`);
     } catch (e) {
       setError(String(e));
     } finally {
@@ -126,14 +164,12 @@ export default function App() {
   }
 
   async function openFolder() {
-    setError(null);
     const dir = await open({ directory: true, title: "Choose a photo folder" });
     if (!dir || Array.isArray(dir)) return;
     await runAnalysis("analyze_library", { folder: dir });
   }
 
   async function openFiles() {
-    setError(null);
     const picked = await open({
       multiple: true,
       title: "Choose photos",
@@ -141,43 +177,40 @@ export default function App() {
     });
     if (!picked) return;
     const paths = Array.isArray(picked) ? picked : [picked];
-    if (paths.length === 0) return;
-    await runAnalysis("analyze_files", { paths });
+    if (paths.length) await runAnalysis("analyze_files", { paths });
   }
 
   const photos = report?.photos ?? [];
-  const selects = useMemo(
-    () => photos.filter((p) => decisions[p.path] === "keep"),
-    [photos, decisions],
-  );
+  const selects = useMemo(() => photos.filter((p) => decisions[p.path] === "keep"), [photos, decisions]);
   const kept = selects.length;
   const rejected = Object.values(decisions).filter((d) => d === "reject").length;
 
   const shown = useMemo(
     () =>
       photos.filter((p) => {
-        switch (filter.kind) {
+        switch (filter) {
           case "blurry": return p.isBlurry;
           case "eyes": return p.eyes?.anyClosed ?? false;
           case "duplicates": return p.cluster != null;
           case "keepers": return decisions[p.path] === "keep";
           case "rejects": return decisions[p.path] === "reject";
-          case "cluster": return p.cluster === filter.id;
-          case "burst": return p.burst === filter.id;
           default: return true;
         }
       }),
     [photos, filter, decisions],
   );
 
-  const chips: { kind: FilterKind; label: string; count: number }[] = [
-    { kind: "all", label: "All", count: photos.length },
-    { kind: "blurry", label: "Blurry", count: photos.filter((p) => p.isBlurry).length },
-    { kind: "eyes", label: "Eyes closed", count: photos.filter((p) => p.eyes?.anyClosed).length },
-    { kind: "duplicates", label: "Duplicates", count: photos.filter((p) => p.cluster != null).length },
-    { kind: "keepers", label: "Selects", count: kept },
-    { kind: "rejects", label: "Rejects", count: rejected },
-  ];
+  const counts: Record<FilterKind, number> = {
+    all: photos.length,
+    blurry: photos.filter((p) => p.isBlurry).length,
+    eyes: photos.filter((p) => p.eyes?.anyClosed).length,
+    duplicates: photos.filter((p) => p.cluster != null).length,
+    keepers: kept,
+    rejects: rejected,
+  };
+
+  const focus = Math.min(focusIdx, Math.max(shown.length - 1, 0));
+  const activePhoto: Photo | undefined = shown[focus];
 
   function decide(path: string, d: Decision) {
     setDecisions((prev) => {
@@ -188,308 +221,302 @@ export default function App() {
     });
   }
 
-  function pickFilter(kind: FilterKind) {
-    setFilter({ kind });
+  function pickFilter(k: FilterKind) {
+    setFilter(k);
     setFocusIdx(0);
+    setLoupe(false);
   }
 
-  // Keep focus cursor inside the visible set as filters change.
+  function goEdit() {
+    if (kept === 0) return;
+    if (project) setMode("edit");
+    else setNamingOpen(true);
+  }
+
+  // clamp focus when the visible set changes
   useEffect(() => {
     setFocusIdx((i) => Math.min(Math.max(i, 0), Math.max(shown.length - 1, 0)));
   }, [shown.length]);
 
+  // scroll focused grid card into view
   useEffect(() => {
-    if (reviewIdx != null) return; // grid hidden behind the reviewer
-    document
-      .querySelector<HTMLElement>(`[data-focus="${focusIdx}"]`)
-      ?.scrollIntoView({ block: "nearest" });
-  }, [focusIdx, reviewIdx]);
+    if (loupe) return;
+    document.querySelector<HTMLElement>(`[data-focus="${focus}"]`)?.scrollIntoView({ block: "nearest" });
+  }, [focus, loupe]);
 
-  // Keyboard shortcuts — CULLING ONLY (edit view has focusable sliders).
+  // culling keyboard (no inputs on this screen)
   useEffect(() => {
     if (mode !== "cull" || !report || namingOpen) return;
     function onKey(e: KeyboardEvent) {
       const tag = (e.target as HTMLElement | null)?.tagName;
       if (tag === "INPUT" || tag === "TEXTAREA") return;
       if (shown.length === 0) return;
-
-      const inReview = reviewIdx != null;
-      const idx = Math.min(inReview ? reviewIdx! : focusIdx, shown.length - 1);
-      const cur = shown[idx];
-      const move = (ni: number) => {
-        const c = Math.min(Math.max(ni, 0), shown.length - 1);
-        if (inReview) setReviewIdx(c);
-        else setFocusIdx(c);
-      };
-
+      const move = (n: number) => setFocusIdx(Math.min(Math.max(n, 0), shown.length - 1));
+      const cur = shown[focus];
       switch (e.key) {
-        case "ArrowRight":
-        case "ArrowDown":
-          e.preventDefault();
-          move(idx + 1);
-          break;
-        case "ArrowLeft":
-        case "ArrowUp":
-          e.preventDefault();
-          move(idx - 1);
-          break;
-        case "p":
-        case "P":
-          decide(cur.path, "keep");
-          move(idx + 1);
-          break;
-        case "x":
-        case "X":
-          decide(cur.path, "reject");
-          move(idx + 1);
-          break;
-        case "Enter":
-          if (!inReview) setReviewIdx(idx);
-          break;
-        case "Escape":
-          if (inReview) setReviewIdx(null);
-          break;
+        case "ArrowRight": case "ArrowDown": e.preventDefault(); move(focus + 1); break;
+        case "ArrowLeft": case "ArrowUp": e.preventDefault(); move(focus - 1); break;
+        case "p": case "P": decide(cur.path, "keep"); move(focus + 1); break;
+        case "x": case "X": decide(cur.path, "reject"); move(focus + 1); break;
+        case "Enter": case "e": case "E": setLoupe(true); break;
+        case "g": case "G": setLoupe(false); break;
+        case "Escape": setLoupe(false); break;
       }
     }
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [mode, report, namingOpen, shown, focusIdx, reviewIdx]);
+  }, [mode, report, namingOpen, shown, focus]);
 
-  // ---- editing actions ----
-  async function batchEditAll() {
-    const paths = selects.map((p) => p.path);
-    if (paths.length === 0) return;
-    setBatchBusy(true);
-    setError(null);
-    setExportMsg(null);
-    try {
-      const edits = await invoke<{ path: string; thumbnail: string }[]>("batch_edit", {
-        paths,
-        params: editParams,
-      });
-      setEditedThumbs(() => {
-        const next: Record<string, string> = {};
-        for (const e of edits) next[e.path] = e.thumbnail;
-        return next;
-      });
-      setExportMsg(`Auto-edit applied to ${edits.length} photo${edits.length === 1 ? "" : "s"}.`);
-    } catch (e) {
-      setError(String(e));
-    } finally {
-      setBatchBusy(false);
-    }
+  // edit-mode: hold Space to temporarily show the original ("hold to compare")
+  useEffect(() => {
+    if (mode !== "edit") return;
+    const down = (e: KeyboardEvent) => { if (e.code === "Space") { e.preventDefault(); setComparing(true); } };
+    const up = (e: KeyboardEvent) => { if (e.code === "Space") setComparing(false); };
+    window.addEventListener("keydown", down);
+    window.addEventListener("keyup", up);
+    return () => { window.removeEventListener("keydown", down); window.removeEventListener("keyup", up); };
+  }, [mode]);
+
+  function paramsFor(path: string): EditParams {
+    return settings[path] ?? DEFAULT_EDIT;
+  }
+  function updateSetting(path: string, key: keyof EditParams, value: number) {
+    setSettings((prev) => ({ ...prev, [path]: { ...(prev[path] ?? DEFAULT_EDIT), [key]: value } }));
+  }
+  function resetPhoto(path: string) {
+    setSettings((prev) => ({ ...prev, [path]: { ...DEFAULT_EDIT } }));
+  }
+  function syncToAll(fromPath: string) {
+    const cur = paramsFor(fromPath);
+    setSettings((prev) => {
+      const next = { ...prev };
+      for (const s of selects) next[s.path] = { ...cur };
+      return next;
+    });
+    setStatus(`Synced these settings to all ${selects.length} select${selects.length === 1 ? "" : "s"}.`);
   }
 
   async function exportSelects() {
-    const paths = selects.map((p) => p.path);
-    if (paths.length === 0) return;
+    if (!selects.length) return;
     const dest = await open({ directory: true, title: "Choose export folder" });
     if (!dest || Array.isArray(dest)) return;
     setError(null);
-    setExportMsg(null);
+    setStatus(null);
     try {
-      const res = await invoke<ExportResult>("export_kept", {
-        paths,
-        dest,
-        edit: exportCorrected ? editParams : null,
-      });
+      const items = selects.map((p) => ({ path: p.path, params: paramsFor(p.path) }));
+      const res = await invoke<ExportResult>("export_selects", { items, dest, corrected: exportCorrected });
       const kind = exportCorrected ? "edited" : "original";
-      const failed = res.errors.length ? ` — ${res.errors.length} failed (${res.errors[0]})` : "";
-      setExportMsg(`Exported ${res.copied} ${kind} photo${res.copied === 1 ? "" : "s"} to ${res.dest}${failed}`);
+      const failed = res.errors.length ? ` — ${res.errors.length} failed` : "";
+      setStatus(`Exported ${res.copied} ${kind} photo${res.copied === 1 ? "" : "s"} to ${res.dest}${failed}`);
     } catch (e) {
       setError(String(e));
     }
   }
 
-  const folderBase =
-    report?.folder ? report.folder.split(/[\\/]/).filter(Boolean).pop() ?? "Untitled" : "Untitled";
+  const folderBase = report?.folder ? report.folder.split(/[\\/]/).filter(Boolean).pop() ?? "Untitled" : "Untitled";
+  const libraryNav: { kind: FilterKind; label: string; icon: string }[] = [
+    { kind: "all", label: "All photos", icon: "▦" },
+    { kind: "blurry", label: "Blurry", icon: "◐" },
+    { kind: "eyes", label: "Eyes closed", icon: "◡" },
+    { kind: "duplicates", label: "Duplicates", icon: "⧉" },
+  ];
+  const selectionNav: { kind: FilterKind; label: string; icon: string }[] = [
+    { kind: "keepers", label: "Selects", icon: "✓" },
+    { kind: "rejects", label: "Rejects", icon: "✕" },
+  ];
 
-  // ======================= EDIT VIEW =======================
+  const topbar = (
+    <header className="topbar">
+      <div className="brand"><span className="brand-mark" />Culler</div>
+      <nav className="tabs">
+        <button className={"tab" + (mode === "cull" ? " active" : "")} onClick={() => setMode("cull")}>Cull</button>
+        <button className={"tab" + (mode === "edit" ? " active" : "")} disabled={kept === 0} onClick={goEdit}>
+          Edit{kept > 0 ? ` · ${kept}` : ""}
+        </button>
+      </nav>
+      <div className="spacer" />
+      {mode === "cull" && report && (
+        <div className="segmented">
+          <button className={"seg" + (!loupe ? " active" : "")} onClick={() => setLoupe(false)} title="Grid (G)">▦ Grid</button>
+          <button className={"seg" + (loupe ? " active" : "")} disabled={!shown.length} onClick={() => setLoupe(true)} title="Loupe (E)">▢ Loupe</button>
+        </div>
+      )}
+    </header>
+  );
+
+  // ============================ EDIT MODE ============================
   if (mode === "edit") {
+    const editPhoto = selects.find((p) => p.path === editPath) ?? selects[0];
     return (
-      <div className="app">
-        <header className="topbar">
-          <button className="ghost" onClick={() => { setMode("cull"); setEditSelected(null); }}>
-            ← Culling
+      <div className="shell">
+        {topbar}
+        <div className="workspace">
+          <aside className="sidebar">
+            <div className="side-head">Project</div>
+            <div className="project-name">{project ?? "Untitled"}</div>
+            <div className="side-sub">{kept} select{kept === 1 ? "" : "s"}</div>
+            <div className="side-head mt">Selects</div>
+            <div className="filmstrip">
+              {selects.map((p) => (
+                <button
+                  key={p.path}
+                  className={"strip" + (editPhoto?.path === p.path ? " active" : "")}
+                  onClick={() => setEditPath(p.path)}
+                >
+                  <img src={p.thumbnail} alt={p.name} loading="lazy" />
+                </button>
+              ))}
+            </div>
+          </aside>
+
+          <main className="stage-wrap">
+            {editPhoto ? (
+              <EditStage
+                photo={editPhoto}
+                params={paramsFor(editPhoto.path)}
+                comparing={comparing}
+                onCompare={setComparing}
+              />
+            ) : (
+              <div className="placeholder"><div className="big">🎞️</div>No selects to edit.</div>
+            )}
+          </main>
+
+          <aside className="panel">
+            {editPhoto ? (
+              <AdjustPanel
+                params={paramsFor(editPhoto.path)}
+                onChange={(k, v) => updateSetting(editPhoto.path, k, v)}
+                onReset={() => resetPhoto(editPhoto.path)}
+              />
+            ) : (
+              <div className="panel-empty">No selects</div>
+            )}
+          </aside>
+        </div>
+
+        <footer className="statusbar">
+          <button className="ghost sm" onClick={() => setMode("cull")}>← Back to culling</button>
+          {status && <span className="status-msg">{status}</span>}
+          {error && <span className="status-msg err">{error}</span>}
+          <div className="spacer" />
+          <button className="primary" onClick={() => editPhoto && syncToAll(editPhoto.path)} disabled={kept === 0} title="Copy this photo's sliders to every select">
+            Sync to all selects
           </button>
-          <div className="brand">
-            {project ?? "Project"} <span className="brand-sub">editing</span>
-          </div>
-          <button className="primary" onClick={batchEditAll} disabled={batchBusy || kept === 0}>
-            {batchBusy ? "Editing…" : `Auto-edit all (${kept})`}
-          </button>
-          <button className="primary" onClick={exportSelects} disabled={kept === 0}>
-            Export ({kept})
-          </button>
-          <label className="toggle" title="Export auto-corrected JPEGs instead of untouched originals">
+          <label className="toggle" title="Export corrected JPEGs instead of untouched originals">
             <input type="checkbox" checked={exportCorrected} onChange={(e) => setExportCorrected(e.target.checked)} />
             edited
           </label>
-          <div className="summary">
-            <strong>{kept}</strong> selects in this project
-            <span className="hint">adjust sliders in a photo, then Auto-edit all</span>
-          </div>
-        </header>
-
-        {error && <div className="error">⚠ {error}</div>}
-        {exportMsg && <div className="notice">✓ {exportMsg}</div>}
-
-        <main className="grid">
-          {selects.map((p) => {
-            const thumb = editedThumbs[p.path] ?? p.thumbnail;
-            return (
-              <figure key={p.path} className="card" onClick={() => setEditSelected(p)}>
-                <div className="thumb-wrap">
-                  {thumb ? (
-                    <img className="thumb" src={thumb} alt={p.name} loading="lazy" />
-                  ) : (
-                    <div className="thumb broken">decode failed</div>
-                  )}
-                  <div className="badges">
-                    {editedThumbs[p.path] && <span className="badge edited">Edited</span>}
-                  </div>
-                </div>
-                <figcaption className="cap">
-                  <span className="cap-name" title={p.name}>{p.name}</span>
-                </figcaption>
-              </figure>
-            );
-          })}
-        </main>
-
-        {editSelected && (
-          <EditDetail
-            photo={editSelected}
-            editParams={editParams}
-            onEditParams={setEditParams}
-            onClose={() => setEditSelected(null)}
-          />
-        )}
+          <button className="confirm" onClick={exportSelects} disabled={kept === 0}>Export ({kept}) →</button>
+        </footer>
       </div>
     );
   }
 
-  // ======================= CULL VIEW =======================
+  // ============================ CULL MODE ============================
   return (
-    <div className="app">
-      <header className="topbar">
-        <div className="brand">
-          Photo Culling <span className="brand-sub">cull</span>
-        </div>
-        <button className="primary" onClick={openFolder} disabled={loading}>
-          {loading ? "Analyzing…" : "Import folder…"}
-        </button>
-        <button className="primary" onClick={openFiles} disabled={loading}>
-          Import files…
-        </button>
-        {report && shown.length > 0 && (
-          <button className="primary" onClick={() => setReviewIdx(Math.min(focusIdx, shown.length - 1))}>
-            Review one-by-one
+    <div className="shell">
+      {topbar}
+      <div className="workspace">
+        <aside className="sidebar">
+          <button className="primary block" onClick={openFolder} disabled={loading}>
+            {loading ? "Analyzing…" : "Import folder"}
           </button>
-        )}
-        {report && (
-          <button
-            className="confirm"
-            onClick={() => setNamingOpen(true)}
-            disabled={kept === 0}
-            title={kept === 0 ? "Keep (P) some photos first" : "Confirm selects and move to editing"}
-          >
-            Confirm Selects ({kept}) →
-          </button>
-        )}
-        {report && (
-          <div className="summary">
-            <strong>{photos.length}</strong> photos
-            <span className="dot">·</span>
-            <strong>{kept}</strong> selects
-            <span className="dot">·</span>
-            <strong>{rejected}</strong> rejects
-            <span className="hint">click a photo to review · P = keep · X = reject · ←/→ = move</span>
-          </div>
-        )}
-      </header>
+          <button className="ghost block" onClick={openFiles} disabled={loading}>Import files</button>
 
-      {error && <div className="error">⚠ {error}</div>}
-      {exportMsg && <div className="notice">✓ {exportMsg}</div>}
-
-      {report && (
-        <nav className="filters">
-          {chips.map((c) => (
-            <button key={c.kind} className={"chip" + (filter.kind === c.kind ? " active" : "")} onClick={() => pickFilter(c.kind)}>
-              {c.label} <span className="chip-count">{c.count}</span>
-            </button>
-          ))}
-          {(filter.kind === "cluster" || filter.kind === "burst") && (
-            <button className="chip active" onClick={() => pickFilter("all")}>
-              {filter.kind === "cluster" ? "Duplicate group" : "Burst"} {filter.id} ✕
-            </button>
-          )}
-        </nav>
-      )}
-
-      {loading && (
-        <div className="placeholder">
-          <div className="spinner" />
-          Decoding images, detecting faces &amp; finding duplicates…
-        </div>
-      )}
-
-      {!loading && !report && !error && (
-        <div className="placeholder">
-          <div className="big">📷</div>
-          Import a folder or files to start culling.
-        </div>
-      )}
-
-      {report && shown.length === 0 && <div className="placeholder muted">No photos match this filter.</div>}
-
-      <main className="grid">
-        {shown.map((p, i) => {
-          const d = decisions[p.path];
-          return (
-            <figure
-              key={p.path}
-              data-focus={i}
-              className={"card" + (d ? " " + d : "") + (i === focusIdx ? " focused" : "")}
-              onClick={() => { setFocusIdx(i); setReviewIdx(i); }}
-            >
-              <div className="thumb-wrap">
-                {p.thumbnail ? (
-                  <img className="thumb" src={p.thumbnail} alt={p.name} loading="lazy" />
-                ) : (
-                  <div className="thumb broken">decode failed</div>
-                )}
-                <div className="badges">
-                  {photoLabels(p).map((l) => (
-                    <span key={l.text} className={"badge " + l.cls}>{l.text}</span>
-                  ))}
-                </div>
-                {d && <div className={"decision-flag " + d}>{d === "keep" ? "SELECT" : "REJECT"}</div>}
+          {report && (
+            <>
+              <div className="side-head mt">Library</div>
+              {libraryNav.map((n) => (
+                <button key={n.kind} className={"nav-row" + (filter === n.kind ? " active" : "")} onClick={() => pickFilter(n.kind)}>
+                  <span className="nav-ic">{n.icon}</span>
+                  <span className="nav-label">{n.label}</span>
+                  <span className="nav-count">{counts[n.kind]}</span>
+                </button>
+              ))}
+              <div className="side-head mt">Selection</div>
+              {selectionNav.map((n) => (
+                <button key={n.kind} className={"nav-row" + (filter === n.kind ? " active" : "")} onClick={() => pickFilter(n.kind)}>
+                  <span className={"nav-ic " + n.kind}>{n.icon}</span>
+                  <span className="nav-label">{n.label}</span>
+                  <span className="nav-count">{counts[n.kind]}</span>
+                </button>
+              ))}
+              <div className="side-foot">
+                <div className="prog-row"><span>Reviewed</span><span>{kept + rejected} / {photos.length}</span></div>
+                <div className="progbar"><div className="progbar-fill" style={{ width: `${photos.length ? ((kept + rejected) / photos.length) * 100 : 0}%` }} /></div>
               </div>
-              <figcaption className="cap">
-                <span className="cap-name" title={p.name}>{p.name}</span>
-                <span className="actions" onClick={(e) => e.stopPropagation()}>
-                  <button className={"act keep" + (d === "keep" ? " on" : "")} onClick={() => decide(p.path, "keep")} title="Keep (P)">✓</button>
-                  <button className={"act reject" + (d === "reject" ? " on" : "")} onClick={() => decide(p.path, "reject")} title="Reject (X)">✕</button>
-                </span>
-              </figcaption>
-            </figure>
-          );
-        })}
-      </main>
+            </>
+          )}
+        </aside>
 
-      {reviewIdx != null && shown[reviewIdx] && (
-        <Reviewer
-          photo={shown[reviewIdx]}
-          index={reviewIdx}
-          total={shown.length}
-          decision={decisions[shown[reviewIdx].path]}
-          onDecide={(d) => { decide(shown[reviewIdx!].path, d); setReviewIdx((i) => Math.min((i ?? 0) + 1, shown.length - 1)); }}
-          onPrev={() => setReviewIdx((i) => Math.max((i ?? 0) - 1, 0))}
-          onNext={() => setReviewIdx((i) => Math.min((i ?? 0) + 1, shown.length - 1))}
-          onClose={() => setReviewIdx(null)}
-        />
-      )}
+        <main className="stage-wrap">
+          {!report && !loading && (
+            <div className="placeholder"><div className="big">📷</div>Import a folder or files to start culling.</div>
+          )}
+          {loading && (
+            <div className="placeholder"><div className="spinner" />Analyzing photos…</div>
+          )}
+          {report && !loading && shown.length === 0 && (
+            <div className="placeholder muted">Nothing matches this view.</div>
+          )}
+          {report && !loading && shown.length > 0 && !loupe && (
+            <div className="grid">
+              {shown.map((p, i) => {
+                const d = decisions[p.path];
+                return (
+                  <figure
+                    key={p.path}
+                    data-focus={i}
+                    className={"card" + (d ? " " + d : "") + (i === focus ? " focused" : "")}
+                    onClick={() => { setFocusIdx(i); setLoupe(true); }}
+                  >
+                    <div className="thumb-wrap">
+                      {p.thumbnail ? <img className="thumb" src={p.thumbnail} alt={p.name} loading="lazy" /> : <div className="thumb broken">no preview</div>}
+                      <div className="badges">
+                        {photoLabels(p).map((l) => <span key={l.text} className={"badge " + l.cls}>{l.text}</span>)}
+                      </div>
+                      {d && <span className={"flag " + d}>{d === "keep" ? "✓" : "✕"}</span>}
+                    </div>
+                  </figure>
+                );
+              })}
+            </div>
+          )}
+          {report && !loading && shown.length > 0 && loupe && activePhoto && (
+            <Loupe
+              photo={activePhoto}
+              index={focus}
+              total={shown.length}
+              onPrev={() => setFocusIdx(Math.max(focus - 1, 0))}
+              onNext={() => setFocusIdx(Math.min(focus + 1, shown.length - 1))}
+            />
+          )}
+        </main>
+
+        <aside className="panel">
+          {activePhoto ? (
+            <PhotoPanel
+              photo={activePhoto}
+              decision={decisions[activePhoto.path]}
+              onKeep={() => decide(activePhoto.path, "keep")}
+              onReject={() => decide(activePhoto.path, "reject")}
+            />
+          ) : (
+            <div className="panel-empty">No photo selected</div>
+          )}
+        </aside>
+      </div>
+
+      <footer className="statusbar">
+        <span className="status-msg">
+          {report ? <>{photos.length} photos <span className="sep">·</span> <span className="c-keep">{kept} selects</span> <span className="sep">·</span> <span className="c-reject">{rejected} rejects</span></> : "No photos loaded"}
+        </span>
+        {error && <span className="status-msg err">{error}</span>}
+        <div className="spacer" />
+        <span className="kbd-hint">P keep · X reject · ←/→ move · E loupe</span>
+        <button className="confirm" disabled={kept === 0} onClick={goEdit}>Confirm Selects ({kept}) →</button>
+      </footer>
 
       {namingOpen && (
         <ProjectPrompt
@@ -503,83 +530,156 @@ export default function App() {
   );
 }
 
-// ======================= Full-screen culling reviewer =======================
-function Reviewer({
-  photo, index, total, decision, onDecide, onPrev, onNext, onClose,
-}: {
-  photo: Photo;
-  index: number;
-  total: number;
-  decision: Decision | undefined;
-  onDecide: (d: Decision) => void;
-  onPrev: () => void;
-  onNext: () => void;
-  onClose: () => void;
+// ---- full-screen loupe (in-center) ----
+function Loupe({ photo, index, total, onPrev, onNext }: {
+  photo: Photo; index: number; total: number; onPrev: () => void; onNext: () => void;
 }) {
   const [img, setImg] = useState<string | null>(null);
-  const [busy, setBusy] = useState(false);
-
   useEffect(() => {
     let cancelled = false;
     setImg(null);
-    setBusy(true);
     invoke<string>("large_preview", { path: photo.path })
       .then((d) => { if (!cancelled) setImg(d); })
-      .catch(() => { if (!cancelled) setImg(photo.thumbnail || null); })
-      .finally(() => { if (!cancelled) setBusy(false); });
+      .catch(() => { if (!cancelled) setImg(photo.thumbnail || null); });
     return () => { cancelled = true; };
   }, [photo.path]);
-
   const labels = photoLabels(photo);
-
   return (
-    <div className="reviewer">
-      <div className="rv-top">
-        <span className="rv-count">{index + 1} / {total}</span>
-        <span className="rv-name" title={photo.name}>{photo.name}</span>
-        <button className="ghost" onClick={onClose}>✕ Back to grid</button>
-      </div>
-
-      <div className="rv-stage">
-        <button className="rv-nav" onClick={onPrev} title="Previous (←)">‹</button>
-        <div className="rv-imgwrap">
-          {img ? (
-            <img className="rv-img" src={img} alt={photo.name} />
-          ) : (
-            <div className="rv-loading">{busy ? "Loading…" : "no preview"}</div>
-          )}
-          <div className="rv-labels">
-            {labels.length ? (
-              labels.map((l) => <span key={l.text} className={"badge " + l.cls}>{l.text}</span>)
-            ) : (
-              <span className="badge ok">No flags</span>
-            )}
-          </div>
-          {decision && <div className={"rv-decision " + decision}>{decision === "keep" ? "SELECT" : "REJECT"}</div>}
+    <div className="loupe">
+      <button className="loupe-nav prev" onClick={onPrev} title="Previous (←)">‹</button>
+      <div className="loupe-img-area">
+        {img ? <img key={photo.path} className="loupe-img" src={img} alt={photo.name} /> : <div className="loupe-loading">Loading…</div>}
+        <div className="loupe-badges">
+          {labels.length ? labels.map((l) => <span key={l.text} className={"badge " + l.cls}>{l.text}</span>) : <span className="badge ok">No flags</span>}
         </div>
-        <button className="rv-nav" onClick={onNext} title="Next (→)">›</button>
+        <div className="loupe-counter">{index + 1} / {total}</div>
       </div>
+      <button className="loupe-nav next" onClick={onNext} title="Next (→)">›</button>
+    </div>
+  );
+}
 
-      <div className="rv-actions">
-        <button className={"rv-btn reject" + (decision === "reject" ? " on" : "")} onClick={() => onDecide("reject")}>
-          ✕ Reject <kbd>X</kbd>
-        </button>
-        <button className={"rv-btn keep" + (decision === "keep" ? " on" : "")} onClick={() => onDecide("keep")}>
-          ✓ Keep <kbd>P</kbd>
-        </button>
+// ---- right inspector (cull) ----
+function PhotoPanel({ photo, decision, onKeep, onReject }: {
+  photo: Photo; decision: Decision | undefined; onKeep: () => void; onReject: () => void;
+}) {
+  const labels = photoLabels(photo);
+  return (
+    <div className="panel-body">
+      <div className="panel-preview">
+        {photo.thumbnail ? <img src={photo.thumbnail} alt={photo.name} /> : <div className="thumb broken">no preview</div>}
+      </div>
+      <div className="panel-name" title={photo.name}>{photo.name}</div>
+      <div className="panel-labels">
+        {labels.length ? labels.map((l) => <span key={l.text} className={"badge " + l.cls}>{l.text}</span>) : <span className="badge ok">No flags</span>}
+      </div>
+      <dl className="meta">
+        <div><dt>Dimensions</dt><dd>{photo.width} × {photo.height}</dd></div>
+        <div><dt>Sharpness</dt><dd className={photo.isBlurry ? "bad" : "good"}>{photo.isBlurry ? "Blurry" : "Sharp"}</dd></div>
+        {photo.eyes ? <div><dt>Eyes</dt><dd>{eyesVerdict(photo.eyes)}</dd></div> : <div><dt>Face</dt><dd>none</dd></div>}
+        {photo.cluster != null && <div><dt>Duplicate</dt><dd>group {photo.cluster}</dd></div>}
+        {photo.burst != null && <div><dt>Burst</dt><dd>#{photo.burst}</dd></div>}
+        <div><dt>Captured</dt><dd>{photo.timestamp ?? "—"}</dd></div>
+      </dl>
+      <div className="panel-decide">
+        <button className={"decide reject" + (decision === "reject" ? " on" : "")} onClick={onReject}>✕ Reject <kbd>X</kbd></button>
+        <button className={"decide keep" + (decision === "keep" ? " on" : "")} onClick={onKeep}>✓ Keep <kbd>P</kbd></button>
       </div>
     </div>
   );
 }
 
-// ======================= Project name prompt =======================
-function ProjectPrompt({
-  defaultName, count, onConfirm, onCancel,
-}: {
-  defaultName: string;
-  count: number;
-  onConfirm: (name: string) => void;
-  onCancel: () => void;
+// ---- right inspector (edit): full adjustment panel ----
+function AdjustPanel({ params, onChange, onReset }: {
+  params: EditParams;
+  onChange: (key: keyof EditParams, value: number) => void;
+  onReset: () => void;
+}) {
+  return (
+    <div className="panel-body adjust">
+      <div className="adjust-head">
+        <span className="side-head">Adjustments</span>
+        <button className="linklike" onClick={onReset}>reset all</button>
+      </div>
+      {ADJUST_GROUPS.map((g) => (
+        <div key={g.title} className="adjust-group">
+          <div className="side-head sub">{g.title}</div>
+          {g.sliders.map((s) => (
+            <SliderRow
+              key={s.key}
+              label={s.label}
+              value={params[s.key]}
+              min={s.min}
+              max={s.max}
+              onChange={(v) => onChange(s.key, v)}
+              onReset={() => onChange(s.key, 0)}
+            />
+          ))}
+        </div>
+      ))}
+      <p className="panel-note">
+        Double-click a slider to reset it. Settings are <strong>per-photo</strong> — use
+        <strong> Sync to all selects</strong> to copy them to the batch. Export writes each photo's
+        own settings.
+      </p>
+    </div>
+  );
+}
+
+// ---- edit center stage: shows edited photo, hold to compare original ----
+function EditStage({ photo, params, comparing, onCompare }: {
+  photo: Photo; params: EditParams; comparing: boolean; onCompare: (v: boolean) => void;
+}) {
+  const [preview, setPreview] = useState<{ before: string; after: string } | null>(null);
+  const [rendering, setRendering] = useState(false);
+  const key = JSON.stringify(params);
+
+  useEffect(() => {
+    if (photo.error) return;
+    let cancelled = false;
+    setRendering(true);
+    const t = setTimeout(async () => {
+      try {
+        const pv = await invoke<{ before: string; after: string }>("preview_edit", { path: photo.path, params });
+        if (!cancelled) setPreview(pv);
+      } catch {
+        if (!cancelled) setPreview(null);
+      } finally {
+        if (!cancelled) setRendering(false);
+      }
+    }, 60);
+    return () => { cancelled = true; clearTimeout(t); };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [photo.path, photo.error, key]);
+
+  const src = preview ? (comparing ? preview.before : preview.after) : photo.thumbnail;
+  return (
+    <div className="stage">
+      <div className="stage-img-wrap">
+        {src ? <img className="stage-img" src={src} alt={photo.name} /> : <div className="thumb broken large">no preview</div>}
+        {comparing && <div className="ba-tag ba-tag-l">Original</div>}
+        {rendering && !comparing && <div className="rendering">Rendering…</div>}
+      </div>
+      <div className="stage-tools">
+        <button
+          className="compare-btn"
+          onMouseDown={() => onCompare(true)}
+          onMouseUp={() => onCompare(false)}
+          onMouseLeave={() => onCompare(false)}
+          onTouchStart={() => onCompare(true)}
+          onTouchEnd={() => onCompare(false)}
+        >
+          Hold to compare <kbd>Space</kbd>
+        </button>
+        <span className="stage-name" title={photo.name}>{photo.name}</span>
+      </div>
+    </div>
+  );
+}
+
+// ---- project prompt ----
+function ProjectPrompt({ defaultName, count, onConfirm, onCancel }: {
+  defaultName: string; count: number; onConfirm: (name: string) => void; onCancel: () => void;
 }) {
   const [name, setName] = useState(defaultName);
   return (
@@ -597,99 +697,33 @@ function ProjectPrompt({
         />
         <div className="modal-actions">
           <button className="ghost" onClick={onCancel}>Cancel</button>
-          <button className="primary" disabled={!name.trim()} onClick={() => onConfirm(name.trim())}>
-            Start editing →
-          </button>
+          <button className="confirm" disabled={!name.trim()} onClick={() => onConfirm(name.trim())}>Start editing →</button>
         </div>
       </div>
     </div>
   );
 }
 
-// ======================= Edit detail (before/after + sliders) =======================
-function EditDetail({
-  photo, editParams, onEditParams, onClose,
-}: {
-  photo: Photo;
-  editParams: EditParams;
-  onEditParams: (p: EditParams) => void;
-  onClose: () => void;
+function SliderRow({ label, value, min, max, onChange, onReset }: {
+  label: string; value: number; min: number; max: number; onChange: (v: number) => void; onReset: () => void;
 }) {
-  const [preview, setPreview] = useState<{ before: string; after: string } | null>(null);
-  const [rendering, setRendering] = useState(false);
-  const [reveal, setReveal] = useState(50);
-
-  useEffect(() => {
-    if (photo.error) return;
-    let cancelled = false;
-    setRendering(true);
-    const t = setTimeout(async () => {
-      try {
-        const pv = await invoke<{ before: string; after: string }>("preview_edit", {
-          path: photo.path,
-          params: editParams,
-        });
-        if (!cancelled) setPreview(pv);
-      } catch {
-        if (!cancelled) setPreview(null);
-      } finally {
-        if (!cancelled) setRendering(false);
-      }
-    }, 200);
-    return () => { cancelled = true; clearTimeout(t); };
-  }, [photo.path, photo.error, editParams.exposure, editParams.whiteBalance, editParams.contrast]);
-
+  const sign = min < 0 && value > 0 ? "+" : "";
   return (
-    <div className="overlay" onClick={onClose}>
-      <div className="detail" onClick={(e) => e.stopPropagation()}>
-        <button className="close" onClick={onClose}>✕</button>
-
-        <div className="detail-media">
-          {preview ? (
-            <div className="ba">
-              <img className="ba-img" src={preview.before} alt="before" />
-              <img className="ba-img ba-after" src={preview.after} alt="after" style={{ clipPath: `inset(0 0 0 ${reveal}%)` }} />
-              <div className="ba-divider" style={{ left: `${reveal}%` }} />
-              <div className="ba-tag ba-tag-l">Before</div>
-              <div className="ba-tag ba-tag-r">After</div>
-              <input className="ba-range" type="range" min={0} max={100} value={reveal} onChange={(e) => setReveal(+e.target.value)} title="Drag to compare" />
-            </div>
-          ) : photo.thumbnail ? (
-            <img className="detail-img" src={photo.thumbnail} alt={photo.name} />
-          ) : (
-            <div className="thumb broken large">decode failed</div>
-          )}
-          {rendering && <div className="rendering">Rendering…</div>}
-        </div>
-
-        <div className="detail-info">
-          <h2 title={photo.name}>{photo.name}</h2>
-          <div className="edit-controls">
-            <div className="edit-title">Auto-edit strength (applies to the whole project)</div>
-            <SliderRow label="Exposure" value={editParams.exposure} onChange={(v) => onEditParams({ ...editParams, exposure: v })} />
-            <SliderRow label="White balance" value={editParams.whiteBalance} onChange={(v) => onEditParams({ ...editParams, whiteBalance: v })} />
-            <SliderRow label="Contrast" value={editParams.contrast} onChange={(v) => onEditParams({ ...editParams, contrast: v })} />
-            <div className="edit-presets">
-              <button className="linklike" onClick={() => onEditParams(DEFAULT_EDIT)}>full (100%)</button>
-              <button className="linklike" onClick={() => onEditParams({ exposure: 0, whiteBalance: 0, contrast: 0 })}>off (0%)</button>
-            </div>
-          </div>
-          <p className="muted small">
-            Drag the divider to compare. These strengths apply to every photo when you click
-            <strong> Auto-edit all</strong> and when you <strong>Export</strong> with “edited” on.
-          </p>
-        </div>
+    <div className="slider-row">
+      <div className="slider-top">
+        <span className="slider-label">{label}</span>
+        <span className={"slider-val" + (value !== 0 ? " set" : "")}>{sign}{value}</span>
       </div>
+      <input
+        type="range"
+        min={min}
+        max={max}
+        value={value}
+        className={min < 0 ? "bipolar" : ""}
+        onChange={(e) => onChange(+e.target.value)}
+        onDoubleClick={onReset}
+        title="Double-click to reset"
+      />
     </div>
-  );
-}
-
-function SliderRow({ label, value, onChange }: { label: string; value: number; onChange: (v: number) => void }) {
-  return (
-    <label className="slider-row">
-      <span className="slider-label">{label}</span>
-      <input type="range" min={0} max={100} value={value} onChange={(e) => onChange(+e.target.value)} />
-      <span className="slider-val">{value}%</span>
-    </label>
   );
 }
