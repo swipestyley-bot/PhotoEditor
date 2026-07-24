@@ -89,6 +89,11 @@ interface ExifInfo {
   focalLength: string | null;
 }
 
+interface Preset {
+  name: string;
+  params: EditParams;
+}
+
 type CropRect = { x: number; y: number; w: number; h: number };
 const ASPECTS = ["Free", "1:1", "4:5", "16:9", "Original"] as const;
 type Aspect = (typeof ASPECTS)[number];
@@ -180,6 +185,18 @@ export default function App() {
   const [cropAspect, setCropAspect] = useState<Aspect>("Free");
   const [editPreview, setEditPreview] = useState<{ before: string; after: string } | null>(null);
   const [editRendering, setEditRendering] = useState(false);
+  const [presets, setPresets] = useState<Preset[]>([]);
+  const [presetNameOpen, setPresetNameOpen] = useState(false);
+  const [exportOpen, setExportOpen] = useState(false);
+  const [renameOn, setRenameOn] = useState(false);
+  const [renamePrefix, setRenamePrefix] = useState("");
+  const [renameStart, setRenameStart] = useState(1);
+  const [wmKind, setWmKind] = useState<"none" | "text" | "image">("none");
+  const [wmText, setWmText] = useState("");
+  const [wmImage, setWmImage] = useState<string | null>(null);
+  const [wmPos, setWmPos] = useState("bottomRight");
+  const [wmOpacity, setWmOpacity] = useState(60);
+  const [wmSize, setWmSize] = useState(40);
 
   async function runAnalysis(command: string, args: Record<string, unknown>) {
     setLoading(true);
@@ -380,18 +397,57 @@ export default function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [mode, editPhoto?.path, editParamsKey, cropMode]);
 
-  async function exportSelects() {
+  // load saved presets once
+  useEffect(() => {
+    invoke<Preset[]>("list_presets").then(setPresets).catch(() => {});
+  }, []);
+
+  async function savePreset(name: string) {
+    if (!editPhoto) return;
+    try {
+      const list = await invoke<Preset[]>("save_preset", { name, params: paramsFor(editPhoto.path) });
+      setPresets(list);
+      setStatus(`Saved preset "${name.trim()}".`);
+    } catch (e) { setError(String(e)); }
+  }
+  async function deletePreset(name: string) {
+    try { setPresets(await invoke<Preset[]>("delete_preset", { name })); } catch (e) { setError(String(e)); }
+  }
+  function applyPreset(params: EditParams) {
+    if (!editPhoto) return;
+    const cur = paramsFor(editPhoto.path);
+    // Presets are a "look" — keep the current photo's geometry (crop + straighten).
+    setSettings((prev) => ({
+      ...prev,
+      [editPhoto.path]: { ...params, cropX: cur.cropX, cropY: cur.cropY, cropW: cur.cropW, cropH: cur.cropH, straighten: cur.straighten },
+    }));
+    setStatus("Preset applied.");
+  }
+
+  async function pickWatermarkImage() {
+    const picked = await open({ title: "Choose watermark image", filters: [{ name: "Image", extensions: ["png", "jpg", "jpeg", "webp"] }] });
+    if (picked && !Array.isArray(picked)) setWmImage(picked);
+  }
+
+  async function runExport() {
     if (!selects.length) return;
     const dest = await open({ directory: true, title: "Choose export folder" });
     if (!dest || Array.isArray(dest)) return;
     setError(null);
     setStatus(null);
+    setExportOpen(false);
     try {
       const items = selects.map((p) => ({ path: p.path, params: paramsFor(p.path) }));
-      const res = await invoke<ExportResult>("export_selects", { items, dest, corrected: exportCorrected });
-      const kind = exportCorrected ? "edited" : "original";
-      const failed = res.errors.length ? ` — ${res.errors.length} failed` : "";
-      setStatus(`Exported ${res.copied} ${kind} photo${res.copied === 1 ? "" : "s"} to ${res.dest}${failed}`);
+      const naming = renameOn && renamePrefix.trim() ? { prefix: renamePrefix.trim(), start: renameStart } : null;
+      let watermark: unknown = null;
+      if (wmKind === "text" && wmText.trim()) {
+        watermark = { kind: "text", text: wmText.trim(), position: wmPos, opacity: wmOpacity, size: wmSize };
+      } else if (wmKind === "image" && wmImage) {
+        watermark = { kind: "image", imagePath: wmImage, position: wmPos, opacity: wmOpacity, size: wmSize };
+      }
+      const res = await invoke<ExportResult>("export_selects", { items, dest, corrected: exportCorrected, naming, watermark });
+      const failed = res.errors.length ? ` — ${res.errors.length} failed (${res.errors[0]})` : "";
+      setStatus(`Exported ${res.copied} photo${res.copied === 1 ? "" : "s"} to ${res.dest}${failed}`);
     } catch (e) {
       setError(String(e));
     }
@@ -459,6 +515,9 @@ export default function App() {
           <aside className="panel edit-panel">
             <Histogram src={editPreview?.after ?? null} />
             {editPhoto && <MetaInfo path={editPhoto.path} />}
+            {editPhoto && (
+              <PresetsPanel presets={presets} onSave={() => setPresetNameOpen(true)} onApply={applyPreset} onDelete={deletePreset} />
+            )}
             {editPhoto ? (
               <AdjustPanel
                 params={paramsFor(editPhoto.path)}
@@ -494,12 +553,84 @@ export default function App() {
           <button className="primary" onClick={() => editPhoto && syncToAll(editPhoto.path)} disabled={kept === 0} title="Copy this photo's sliders to every select">
             Sync to all selects
           </button>
-          <label className="toggle" title="Export corrected JPEGs instead of untouched originals">
-            <input type="checkbox" checked={exportCorrected} onChange={(e) => setExportCorrected(e.target.checked)} />
-            edited
-          </label>
-          <button className="confirm" onClick={exportSelects} disabled={kept === 0}>Export ({kept}) →</button>
+          <button className="confirm" onClick={() => setExportOpen(true)} disabled={kept === 0}>Export ({kept}) →</button>
         </footer>
+
+        {exportOpen && (
+          <div className="overlay" onClick={() => setExportOpen(false)}>
+            <div className="modal export-modal" onClick={(e) => e.stopPropagation()}>
+              <h2>Export {kept} select{kept === 1 ? "" : "s"}</h2>
+
+              <label className="toggle wide">
+                <input type="checkbox" checked={exportCorrected} onChange={(e) => setExportCorrected(e.target.checked)} />
+                Apply edits (export corrected JPEGs)
+              </label>
+
+              <div className="export-section">
+                <label className="toggle wide">
+                  <input type="checkbox" checked={renameOn} onChange={(e) => setRenameOn(e.target.checked)} />
+                  Rename files
+                </label>
+                {renameOn && (
+                  <>
+                    <div className="export-row">
+                      <input className="text-input sm" placeholder="Prefix e.g. SmithWedding" value={renamePrefix} onChange={(e) => setRenamePrefix(e.target.value)} />
+                      <input className="text-input tiny" type="number" min={0} value={renameStart} onChange={(e) => setRenameStart(Math.max(0, parseInt(e.target.value) || 0))} title="Start number" />
+                    </div>
+                    <div className="ex-preview">→ {(renamePrefix || "prefix")}_{String(renameStart).padStart(3, "0")}.jpg</div>
+                  </>
+                )}
+              </div>
+
+              <div className="export-section">
+                <div className="ex-label">Watermark</div>
+                <div className="segmented ex-seg">
+                  {(["none", "text", "image"] as const).map((k) => (
+                    <button key={k} className={"seg" + (wmKind === k ? " active" : "")} onClick={() => setWmKind(k)}>{k}</button>
+                  ))}
+                </div>
+                {wmKind === "text" && (
+                  <input className="text-input sm wide" placeholder="Watermark text (e.g. © Smith Studio)" value={wmText} onChange={(e) => setWmText(e.target.value)} />
+                )}
+                {wmKind === "image" && (
+                  <button className="ghost sm wide" onClick={pickWatermarkImage}>
+                    {wmImage ? (wmImage.split(/[\\/]/).pop() ?? "image") : "Choose image (PNG)…"}
+                  </button>
+                )}
+                {wmKind !== "none" && (
+                  <>
+                    <div className="export-row">
+                      <span className="ex-mini">Position</span>
+                      <select className="text-input sm" value={wmPos} onChange={(e) => setWmPos(e.target.value)}>
+                        <option value="bottomRight">Bottom right</option>
+                        <option value="bottomLeft">Bottom left</option>
+                        <option value="topRight">Top right</option>
+                        <option value="topLeft">Top left</option>
+                        <option value="center">Center</option>
+                      </select>
+                    </div>
+                    <SliderRow label="Opacity" value={wmOpacity} min={0} max={100} onChange={setWmOpacity} onReset={() => setWmOpacity(60)} />
+                    <SliderRow label="Size" value={wmSize} min={0} max={100} onChange={setWmSize} onReset={() => setWmSize(40)} />
+                  </>
+                )}
+              </div>
+
+              <div className="modal-actions">
+                <button className="ghost" onClick={() => setExportOpen(false)}>Cancel</button>
+                <button className="confirm" onClick={runExport}>Choose folder &amp; export →</button>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {presetNameOpen && (
+          <NamePrompt
+            title="Save preset"
+            placeholder="e.g. Warm Portrait"
+            onCancel={() => setPresetNameOpen(false)}
+            onConfirm={(n) => { setPresetNameOpen(false); savePreset(n); }}
+          />
+        )}
       </div>
     );
   }
@@ -830,6 +961,58 @@ function MetaInfo({ path }: { path: string }) {
       ) : (
         <div className="meta-empty">No camera EXIF</div>
       )}
+    </div>
+  );
+}
+
+// ---- presets ----
+function PresetsPanel({ presets, onSave, onApply, onDelete }: {
+  presets: Preset[]; onSave: () => void; onApply: (p: EditParams) => void; onDelete: (name: string) => void;
+}) {
+  return (
+    <div className="presets-panel">
+      <div className="hist-head">
+        <span className="group-ic">◈</span> Presets
+        <button className="preset-add" onClick={onSave} title="Save current settings as a preset">＋ Save</button>
+      </div>
+      {presets.length ? (
+        <div className="preset-list">
+          {presets.map((p) => (
+            <div key={p.name} className="preset-row">
+              <button className="preset-apply" onClick={() => onApply(p.params)} title="Apply to this photo">{p.name}</button>
+              <button className="preset-del" onClick={() => onDelete(p.name)} title="Delete preset">✕</button>
+            </div>
+          ))}
+        </div>
+      ) : (
+        <div className="meta-empty">No saved presets yet</div>
+      )}
+    </div>
+  );
+}
+
+// ---- generic name prompt ----
+function NamePrompt({ title, placeholder, onConfirm, onCancel }: {
+  title: string; placeholder: string; onConfirm: (name: string) => void; onCancel: () => void;
+}) {
+  const [name, setName] = useState("");
+  return (
+    <div className="overlay" onClick={onCancel}>
+      <div className="modal" onClick={(e) => e.stopPropagation()}>
+        <h2>{title}</h2>
+        <input
+          autoFocus
+          className="text-input"
+          value={name}
+          placeholder={placeholder}
+          onChange={(e) => setName(e.target.value)}
+          onKeyDown={(e) => { if (e.key === "Enter" && name.trim()) onConfirm(name.trim()); }}
+        />
+        <div className="modal-actions">
+          <button className="ghost" onClick={onCancel}>Cancel</button>
+          <button className="confirm" disabled={!name.trim()} onClick={() => onConfirm(name.trim())}>Save</button>
+        </div>
+      </div>
     </div>
   );
 }

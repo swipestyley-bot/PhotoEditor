@@ -12,12 +12,12 @@
 //! (needs neighbours) runs last on the 8-bit image.
 
 use image::{imageops::FilterType, DynamicImage, Rgb, RgbImage};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 /// Per-photo edit settings. Auto strengths are 0..100; manual sliders are
 /// -100..100 (bipolar) except `sharpening` (0..100) and `straighten`
 /// (-100..100 mapped to ±[`STRAIGHTEN_MAX_DEG`]°). All default to 0 = identity.
-#[derive(Debug, Clone, Copy, Deserialize)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct EditParams {
     pub auto_exposure: f32,

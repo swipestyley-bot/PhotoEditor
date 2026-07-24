@@ -1111,6 +1111,71 @@ body {
   color: var(--text-3);
 }
 
+/* ---- presets ---- */
+.presets-panel {
+  padding: 12px 16px;
+  border-bottom: 1px solid var(--line);
+}
+.preset-add {
+  margin-left: auto;
+  background: var(--accent-weak);
+  color: var(--accent-2);
+  border: 1px solid var(--accent-line);
+  border-radius: 6px;
+  padding: 3px 9px;
+  font-size: 11px;
+  font-weight: 600;
+  font-family: inherit;
+  cursor: pointer;
+}
+.preset-add:hover {
+  background: rgba(224, 162, 74, 0.2);
+}
+.preset-list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-top: 8px;
+}
+.preset-row {
+  display: flex;
+  gap: 4px;
+}
+.preset-apply {
+  flex: 1;
+  text-align: left;
+  background: var(--elev);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 7px 10px;
+  color: var(--text);
+  font-size: 12.5px;
+  font-family: inherit;
+  cursor: pointer;
+  transition: border-color 0.12s, background 0.12s;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.preset-apply:hover {
+  border-color: var(--accent-line);
+  background: var(--bg-3);
+}
+.preset-del {
+  width: 28px;
+  flex-shrink: 0;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--elev);
+  color: var(--text-3);
+  cursor: pointer;
+  font-size: 11px;
+}
+.preset-del:hover {
+  color: var(--reject);
+  border-color: var(--reject);
+}
+
 /* collapsible tool sections */
 .adjust-group {
   border-bottom: 1px solid var(--line);
@@ -1343,4 +1408,75 @@ body {
   justify-content: flex-end;
   gap: 10px;
   margin-top: 20px;
+}
+
+/* ---- export dialog ---- */
+.export-modal {
+  width: 440px;
+}
+.export-section {
+  border-top: 1px solid var(--line);
+  padding-top: 12px;
+  margin-top: 14px;
+}
+.toggle.wide {
+  display: flex;
+  width: 100%;
+  font-size: 13px;
+  color: var(--text);
+}
+.export-row {
+  display: flex;
+  gap: 8px;
+  margin-top: 8px;
+}
+.text-input.sm {
+  padding: 7px 10px;
+  font-size: 13px;
+  flex: 1;
+}
+.text-input.tiny {
+  width: 64px;
+  flex: none;
+  padding: 7px 8px;
+  font-size: 13px;
+}
+.text-input.wide {
+  width: 100%;
+  margin-top: 8px;
+}
+select.text-input {
+  cursor: pointer;
+}
+.ex-preview {
+  margin-top: 6px;
+  font-size: 12px;
+  color: var(--accent-2);
+  font-variant-numeric: tabular-nums;
+}
+.ex-label {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.6px;
+  color: var(--text-3);
+  font-weight: 700;
+  margin-bottom: 8px;
+}
+.ex-seg {
+  display: inline-flex;
+  margin-bottom: 8px;
+}
+.ex-seg .seg {
+  text-transform: capitalize;
+}
+.ex-mini {
+  font-size: 12px;
+  color: var(--text-2);
+  align-self: center;
+  width: 64px;
+}
+.ghost.sm.wide {
+  width: 100%;
+  text-align: left;
+  margin-top: 8px;
 }

@@ -15,6 +15,7 @@ use base64::Engine as _;
 use image::codecs::jpeg::JpegEncoder;
 use image::{DynamicImage, ExtendedColorType, ImageEncoder, ImageFormat};
 use serde::{Deserialize, Serialize};
+use tauri::Manager;
 
 use crate::dedup::{
     cluster_by_similarity, exif_timestamp, group_bursts, perceptual_hash, Fingerprint,
@@ -161,6 +162,69 @@ pub fn read_exif(path: String) -> Result<ExifInfo, String> {
         shutter: get(exif::Tag::ExposureTime),
         focal_length: get(exif::Tag::FocalLength),
     })
+}
+
+/// A named, saved edit-setting combination.
+#[derive(Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct Preset {
+    pub name: String,
+    pub params: crate::edit::EditParams,
+}
+
+/// `<app config dir>/presets.json`, creating the dir if needed.
+fn presets_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
+    let dir = app.path().app_config_dir().map_err(|e| format!("config dir: {e}"))?;
+    std::fs::create_dir_all(&dir).map_err(|e| format!("create config dir: {e}"))?;
+    Ok(dir.join("presets.json"))
+}
+
+fn load_presets(app: &tauri::AppHandle) -> Vec<Preset> {
+    presets_path(app)
+        .ok()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+fn write_presets(app: &tauri::AppHandle, presets: &[Preset]) -> Result<(), String> {
+    let path = presets_path(app)?;
+    let json = serde_json::to_string_pretty(presets).map_err(|e| e.to_string())?;
+    std::fs::write(&path, json).map_err(|e| format!("write presets: {e}"))
+}
+
+#[tauri::command]
+pub fn list_presets(app: tauri::AppHandle) -> Vec<Preset> {
+    load_presets(&app)
+}
+
+/// Save (or overwrite) a named preset; returns the updated list.
+#[tauri::command]
+pub fn save_preset(
+    app: tauri::AppHandle,
+    name: String,
+    params: crate::edit::EditParams,
+) -> Result<Vec<Preset>, String> {
+    let name = name.trim().to_string();
+    if name.is_empty() {
+        return Err("preset name is empty".into());
+    }
+    let mut presets = load_presets(&app);
+    if let Some(existing) = presets.iter_mut().find(|p| p.name == name) {
+        existing.params = params;
+    } else {
+        presets.push(Preset { name, params });
+    }
+    write_presets(&app, &presets)?;
+    Ok(presets)
+}
+
+#[tauri::command]
+pub fn delete_preset(app: tauri::AppHandle, name: String) -> Result<Vec<Preset>, String> {
+    let mut presets = load_presets(&app);
+    presets.retain(|p| p.name != name);
+    write_presets(&app, &presets)?;
+    Ok(presets)
 }
 
 /// Resolve the ONNX models directory. Dev-only: bakes the build machine's
@@ -348,15 +412,37 @@ pub struct ExportItem {
     pub params: crate::edit::EditParams,
 }
 
-/// Export selects into `dest`, leaving originals in place. When `corrected` is
-/// true, each photo is decoded, its own edit settings applied, and written as a
-/// JPEG; otherwise the original file is copied byte-for-byte. Names that would
-/// collide get a ` (n)` suffix, so nothing is overwritten.
+/// Batch-rename pattern: output files become `{prefix}_{NNN}` from `start`.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Naming {
+    pub prefix: String,
+    pub start: u32,
+}
+
+/// Optional export watermark — text or an image, placed at a corner/center.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Watermark {
+    pub kind: String, // "text" | "image"
+    pub text: Option<String>,
+    pub image_path: Option<String>,
+    pub position: String, // topLeft | topRight | bottomLeft | bottomRight | center
+    pub opacity: f32,     // 0..100
+    pub size: f32,        // 0..100
+}
+
+/// Export selects into `dest`, leaving originals in place. `corrected` applies
+/// each photo's edits; `naming` renames output sequentially; `watermark` stamps
+/// text or an image on each export. Anything that renders (edit or watermark) is
+/// written as JPEG; otherwise the original is copied. Collisions get ` (n)`.
 #[tauri::command]
 pub fn export_selects(
     items: Vec<ExportItem>,
     dest: String,
     corrected: bool,
+    naming: Option<Naming>,
+    watermark: Option<Watermark>,
 ) -> Result<ExportResult, String> {
     let dest_dir = PathBuf::from(&dest);
     if !dest_dir.is_dir() {
@@ -364,21 +450,36 @@ pub fn export_selects(
     }
     let mut copied = 0;
     let mut errors = Vec::new();
-    for item in &items {
+    for (i, item) in items.iter().enumerate() {
         let src = Path::new(&item.path);
         let Some(stem) = src.file_stem() else {
             errors.push(format!("skipped (no file name): {}", item.path));
             continue;
         };
-        let result = if corrected && !item.params.is_noop() {
-            // Edited exports are re-encoded as JPEG regardless of input format.
-            let target = unique_in(&dest_dir, &format!("{}.jpg", stem.to_string_lossy()));
-            decode_image(src)
-                .map(|img| crate::edit::auto_edit(&img, item.params))
-                .and_then(|edited| save_jpeg(&edited, &target))
+        let edit = corrected && !item.params.is_noop();
+        let render = edit || watermark.is_some();
+        let ext = if render {
+            "jpg".to_string()
         } else {
-            let name = src.file_name().unwrap_or(stem).to_string_lossy().to_string();
-            let target = unique_in(&dest_dir, &name);
+            src.extension().map(|e| e.to_string_lossy().to_string()).unwrap_or_else(|| "jpg".into())
+        };
+        let filename = match &naming {
+            Some(n) => format!("{}_{:03}.{}", n.prefix, n.start as usize + i, ext),
+            None if render => format!("{}.jpg", stem.to_string_lossy()),
+            None => src.file_name().unwrap_or(stem).to_string_lossy().to_string(),
+        };
+        let target = unique_in(&dest_dir, &filename);
+
+        let result = if render {
+            decode_image(src).and_then(|img| {
+                let img = if edit { crate::edit::auto_edit(&img, item.params) } else { img };
+                let img = match &watermark {
+                    Some(wm) => apply_watermark(img, wm)?,
+                    None => img,
+                };
+                save_jpeg(&img, &target)
+            })
+        } else {
             std::fs::copy(src, &target)
                 .map(|_| ())
                 .map_err(|e| format!("{}: {e}", src.display()))
@@ -393,6 +494,104 @@ pub fn export_selects(
         dest,
         errors,
     })
+}
+
+fn wm_position(pos: &str, w: i32, h: i32, ew: i32, eh: i32, margin: i32) -> (i32, i32) {
+    match pos {
+        "topLeft" => (margin, margin),
+        "topRight" => (w - ew - margin, margin),
+        "bottomLeft" => (margin, h - eh - margin),
+        "center" => ((w - ew) / 2, (h - eh) / 2),
+        _ => (w - ew - margin, h - eh - margin), // bottomRight
+    }
+}
+
+/// Load a font for the text watermark. Dev: uses a Windows system font.
+/// TODO(ship): bundle a permissively-licensed font for cross-platform builds.
+fn load_font() -> Result<ab_glyph::FontVec, String> {
+    let candidates = [
+        r"C:\Windows\Fonts\segoeuib.ttf",
+        r"C:\Windows\Fonts\arialbd.ttf",
+        r"C:\Windows\Fonts\arial.ttf",
+        r"C:\Windows\Fonts\segoeui.ttf",
+    ];
+    for c in candidates {
+        if let Ok(bytes) = std::fs::read(c) {
+            if let Ok(font) = ab_glyph::FontVec::try_from_vec(bytes) {
+                return Ok(font);
+            }
+        }
+    }
+    Err("no system font found for the text watermark".into())
+}
+
+fn watermark_text(rgb: &mut image::RgbImage, text: &str, pos: &str, opacity: f32, size: f32) -> Result<(), String> {
+    let font = load_font()?;
+    let (w, h) = rgb.dimensions();
+    let px = (h as f32 * (0.02 + (size / 100.0).clamp(0.0, 1.0) * 0.08)).max(9.0);
+    let scale = ab_glyph::PxScale::from(px);
+    let (tw, th) = imageproc::drawing::text_size(scale, &font, text);
+    let margin = (h as f32 * 0.02).max(6.0) as i32;
+    let (x, y) = wm_position(pos, w as i32, h as i32, tw as i32, th as i32, margin);
+    let mut mask = image::GrayImage::new(w, h);
+    imageproc::drawing::draw_text_mut(&mut mask, image::Luma([255u8]), x, y, scale, &font, text);
+    let op = (opacity / 100.0).clamp(0.0, 1.0);
+    for (out, m) in rgb.pixels_mut().zip(mask.pixels()) {
+        let a = m[0] as f32 / 255.0 * op;
+        if a > 0.0 {
+            for c in 0..3 {
+                out[c] = (out[c] as f32 * (1.0 - a) + 255.0 * a).round() as u8;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn watermark_image(rgb: &mut image::RgbImage, path: &str, pos: &str, opacity: f32, size: f32) -> Result<(), String> {
+    let overlay = image::open(path)
+        .map_err(|e| format!("open watermark image {path}: {e}"))?
+        .to_rgba8();
+    let (w, h) = rgb.dimensions();
+    let target_w = ((w as f32) * (0.1 + (size / 100.0).clamp(0.0, 1.0) * 0.4)).max(1.0) as u32;
+    let scale = target_w as f32 / overlay.width().max(1) as f32;
+    let target_h = ((overlay.height() as f32) * scale).max(1.0) as u32;
+    let overlay = image::imageops::resize(&overlay, target_w, target_h, image::imageops::FilterType::Triangle);
+    let margin = (w as f32 * 0.02).max(6.0) as i32;
+    let (ox, oy) = wm_position(pos, w as i32, h as i32, target_w as i32, target_h as i32, margin);
+    let op = (opacity / 100.0).clamp(0.0, 1.0);
+    for (wx, wy, wp) in overlay.enumerate_pixels() {
+        let (px, py) = (ox + wx as i32, oy + wy as i32);
+        if px < 0 || py < 0 || px >= w as i32 || py >= h as i32 {
+            continue;
+        }
+        let a = wp[3] as f32 / 255.0 * op;
+        if a > 0.0 {
+            let dst = rgb.get_pixel_mut(px as u32, py as u32);
+            for c in 0..3 {
+                dst[c] = (dst[c] as f32 * (1.0 - a) + wp[c] as f32 * a).round() as u8;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn apply_watermark(img: DynamicImage, wm: &Watermark) -> Result<DynamicImage, String> {
+    let mut rgb = img.to_rgb8();
+    match wm.kind.as_str() {
+        "text" => {
+            let text = wm.text.as_deref().unwrap_or("").trim().to_string();
+            if !text.is_empty() {
+                watermark_text(&mut rgb, &text, &wm.position, wm.opacity, wm.size)?;
+            }
+        }
+        "image" => {
+            if let Some(p) = &wm.image_path {
+                watermark_image(&mut rgb, p, &wm.position, wm.opacity, wm.size)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(DynamicImage::ImageRgb8(rgb))
 }
 
 /// Write `img` as a high-quality JPEG to `path`.

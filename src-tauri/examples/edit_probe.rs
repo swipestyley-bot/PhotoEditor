@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 
 use image::DynamicImage;
 use tauri_app_lib::edit::{auto_edit, EditParams};
-use tauri_app_lib::library::{export_selects, ExportItem};
+use tauri_app_lib::library::{export_selects, ExportItem, Naming, Watermark};
 use tauri_app_lib::vision::decode_image;
 
 fn luma(r: u8, g: u8, b: u8) -> f32 {
@@ -179,24 +179,45 @@ fn main() {
     }
 
     // export_selects both ways over all photos.
-    let ed_dir = Path::new(&out).join("export_edited");
-    let or_dir = Path::new(&out).join("export_original");
+    let ed_dir = Path::new(&out).join("export_renamed");
+    let wm_dir = Path::new(&out).join("export_watermarked");
     fs::create_dir_all(&ed_dir).unwrap();
-    fs::create_dir_all(&or_dir).unwrap();
-    let items: Vec<ExportItem> = paths
-        .iter()
-        .map(|p| ExportItem { path: p.to_string_lossy().to_string(), params: combo })
-        .collect();
-    let orig: Vec<ExportItem> = paths
-        .iter()
-        .map(|p| ExportItem { path: p.to_string_lossy().to_string(), params: EditParams::default() })
-        .collect();
-    let e = export_selects(items, ed_dir.to_string_lossy().to_string(), true).unwrap();
-    let o = export_selects(orig, or_dir.to_string_lossy().to_string(), false).unwrap();
-    println!("\nexport_selects (per-photo params, all {} in one call):", paths.len());
-    println!("  corrected: {} JPEGs -> {}", e.copied, ed_dir.display());
-    println!("  original : {} files -> {}", o.copied, or_dir.display());
+    fs::create_dir_all(&wm_dir).unwrap();
+    let mk = |prm: EditParams, n: usize| -> Vec<ExportItem> {
+        paths.iter().take(n).map(|p| ExportItem { path: p.to_string_lossy().to_string(), params: prm }).collect()
+    };
+    // Edited + batch rename (TestShoot_001, _002, ...)
+    let e = export_selects(
+        mk(combo, paths.len()),
+        ed_dir.to_string_lossy().to_string(),
+        true,
+        Some(Naming { prefix: "TestShoot".into(), start: 1 }),
+        None,
+    )
+    .unwrap();
+    // Text watermark on the first 4
+    let wm = export_selects(
+        mk(EditParams::default(), 4),
+        wm_dir.to_string_lossy().to_string(),
+        false,
+        None,
+        Some(Watermark {
+            kind: "text".into(),
+            text: Some("© Test Studio".into()),
+            image_path: None,
+            position: "bottomRight".into(),
+            opacity: 60.0,
+            size: 45.0,
+        }),
+    )
+    .unwrap();
+    println!("\nexport_selects:");
+    println!("  edited + renamed: {} JPEGs (TestShoot_001..) -> {}", e.copied, ed_dir.display());
+    println!("  text watermark  : {} JPEGs -> {}", wm.copied, wm_dir.display());
     if !e.errors.is_empty() {
-        println!("  errors: {:?}", e.errors);
+        println!("  edited errors: {:?}", e.errors);
+    }
+    if !wm.errors.is_empty() {
+        println!("  watermark errors: {:?}", wm.errors);
     }
 }
