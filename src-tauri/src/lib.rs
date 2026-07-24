@@ -1,4 +1,5 @@
 pub mod dedup;
+pub mod edit;
 pub mod face;
 pub mod library;
 pub mod vision;
@@ -32,7 +33,10 @@ pub fn run() {
             dedup::find_duplicate_clusters,
             library::analyze_library,
             library::analyze_files,
-            library::export_kept
+            library::export_kept,
+            library::preview_edit,
+            library::batch_edit,
+            library::large_preview
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
