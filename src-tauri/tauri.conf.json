@@ -12,9 +12,11 @@
   "app": {
     "windows": [
       {
-        "title": "tauri-app",
-        "width": 800,
-        "height": 600
+        "title": "Photo Culling",
+        "width": 1280,
+        "height": 820,
+        "minWidth": 720,
+        "minHeight": 520
       }
     ],
     "security": {
