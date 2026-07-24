@@ -647,8 +647,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1aa79e62e7697b8e29b513a68abacf485adcd1fe8284a4316c5ae868e6633327"
 dependencies = [
  "iana-time-zone",
+ "js-sys",
  "num-traits",
  "serde",
+ "wasm-bindgen",
  "windows-link 0.2.1",
 ]
 
@@ -2328,6 +2330,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "kamadak-exif"
+version = "0.6.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1130d80c7374efad55a117d715a3af9368f0fa7a2c54573afc15a188cd984837"
+dependencies = [
+ "mutate_once",
+]
+
+[[package]]
 name = "keyboard-types"
 version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2588,6 +2599,12 @@ checksum = "5086074c0a0812980aa88703d1bbcb4433e8423ecf4098a9849934f3dc09ba72"
 dependencies = [
  "linked-hash-map",
 ]
+
+[[package]]
+name = "mutate_once"
+version = "0.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "13d2233c9842d08cfe13f9eac96e207ca6a2ea10b80259ebe8ad0268be27d2af"
 
 [[package]]
 name = "nalgebra"
@@ -4429,10 +4446,12 @@ dependencies = [
 name = "tauri-app"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "image 0.25.10",
  "image_hasher",
  "imagepipe",
  "imageproc",
+ "kamadak-exif",
  "ndarray",
  "ort",
  "rawloader",

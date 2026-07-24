@@ -33,4 +33,6 @@ imagepipe = "0.5.0"
 # the DLL at runtime via the ORT_DYLIB_PATH env var (see face.rs docs).
 ort = { version = "2.0.0-rc.12", default-features = false, features = ["load-dynamic", "ndarray", "api-24"] }
 ndarray = "0.17.2"
+kamadak-exif = "0.6.1"
+chrono = "0.4.45"
 

@@ -1,3 +1,4 @@
+pub mod dedup;
 pub mod face;
 pub mod vision;
 
@@ -14,7 +15,8 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             greet,
             vision::analyze_image,
-            face::analyze_face_eyes
+            face::analyze_face_eyes,
+            dedup::find_duplicate_clusters
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

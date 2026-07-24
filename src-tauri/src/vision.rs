@@ -1,21 +1,16 @@
-//! Image decoding + basic computer-vision primitives for the culling backend.
+//! Image decoding + single-image quality metrics for the culling backend.
 //!
-//! Everything here is pure-Rust and runs in-process for performance:
-//!   * RAW decoding      -> `rawloader` + `imagepipe`
-//!   * standard decoding -> `image`
-//!   * blur detection    -> Laplacian variance via `imageproc`
-//!   * duplicate hashing  -> perceptual hash via `image_hasher`
+//! Pure-Rust, in-process:
+//!   * RAW decoding    -> `rawloader` + `imagepipe`
+//!   * standard decode -> `image`
+//!   * blur detection  -> Laplacian variance via `imageproc`
 //!
-//! Face landmark / eyes-closed detection is intentionally NOT implemented here
-//! yet: pure-Rust options are weak. See the module-level notes in the project
-//! README / the chat write-up for the recommended `ort` (ONNX Runtime) vs.
-//! Python-sidecar path. `blur_score` and `perceptual_hash` are the two pieces
-//! proven end-to-end by the tests below.
+//! Duplicate detection (perceptual hashing, clustering, EXIF) lives in
+//! `dedup.rs`; face / eyes-closed analysis in `face.rs`.
 
 use std::path::Path;
 
 use image::{DynamicImage, GrayImage};
-use image_hasher::{HashAlg, HasherConfig};
 use serde::Serialize;
 
 /// File extensions we route through the RAW decoder rather than the standard
@@ -91,24 +86,28 @@ pub fn blur_score(img: &DynamicImage) -> f64 {
     variance(laplacian.as_raw())
 }
 
-/// Perceptual hash (gradient / "dHash" by default) as a base64 string, suitable
-/// for near-duplicate detection: visually similar frames yield hashes with a
-/// small Hamming distance. Compare two with [`hash_distance`].
-pub fn perceptual_hash(img: &DynamicImage) -> String {
-    let hasher = HasherConfig::new()
-        .hash_alg(HashAlg::Gradient)
-        .hash_size(16, 16)
-        .to_hasher();
-    hasher.hash_image(img).to_base64()
+/// Default blur-score threshold below which an image is flagged blurry.
+/// VALIDATE: the Laplacian-variance scale is strongly resolution- and
+/// content-dependent (a sharp full-res frame scores far higher than a
+/// downscaled one), so calibrate this against your real photo set.
+pub const DEFAULT_BLUR_THRESHOLD: f64 = 100.0;
+
+/// Blur verdict for an image: the raw focus measure plus a threshold decision.
+/// Mirrors the score+threshold+verdict shape of `face::EyesState`.
+#[derive(Debug, Clone, Copy, Serialize)]
+pub struct BlurAssessment {
+    pub score: f64,
+    pub is_blurry: bool,
 }
 
-/// Hamming distance between two base64 perceptual hashes produced by
-/// [`perceptual_hash`]. `0` = identical; larger = more different.
-pub fn hash_distance(a: &str, b: &str) -> Result<u32, String> {
-    use image_hasher::ImageHash;
-    let ha = ImageHash::<Box<[u8]>>::from_base64(a).map_err(|e| format!("{e:?}"))?;
-    let hb = ImageHash::<Box<[u8]>>::from_base64(b).map_err(|e| format!("{e:?}"))?;
-    Ok(ha.dist(&hb))
+/// Score an image's sharpness and classify it against `threshold`
+/// (see [`DEFAULT_BLUR_THRESHOLD`]).
+pub fn assess_blur(img: &DynamicImage, threshold: f64) -> BlurAssessment {
+    let score = blur_score(img);
+    BlurAssessment {
+        score,
+        is_blurry: score < threshold,
+    }
 }
 
 fn variance(data: &[i16]) -> f64 {
@@ -132,20 +131,25 @@ pub struct ImageAnalysis {
     pub width: u32,
     pub height: u32,
     pub blur_score: f64,
+    pub is_blurry: bool,
     pub perceptual_hash: String,
     pub is_raw: bool,
 }
 
-/// Tauri command: decode an image from disk and run the CV pipeline on it.
+/// Tauri command: decode an image from disk and run the single-image metrics.
+/// The perceptual hash comes from [`crate::dedup`] (pHash) for duplicate
+/// detection.
 #[tauri::command]
 pub fn analyze_image(path: String) -> Result<ImageAnalysis, String> {
     let p = Path::new(&path);
     let img = decode_image(p)?;
+    let blur = assess_blur(&img, DEFAULT_BLUR_THRESHOLD);
     Ok(ImageAnalysis {
         width: img.width(),
         height: img.height(),
-        blur_score: blur_score(&img),
-        perceptual_hash: perceptual_hash(&img),
+        blur_score: blur.score,
+        is_blurry: blur.is_blurry,
+        perceptual_hash: crate::dedup::perceptual_hash(&img),
         is_raw: is_raw_path(p),
     })
 }
@@ -210,21 +214,18 @@ mod tests {
     }
 
     #[test]
-    fn perceptual_hash_is_stable_and_discriminating() {
+    fn assess_blur_flags_blurred_not_sharp() {
         let sharp = DynamicImage::ImageRgb8(sharp_checkerboard(128));
         let blurred = DynamicImage::ImageRgb8(imageproc::filter::gaussian_blur_f32(
             sharp.as_rgb8().unwrap(),
             4.0,
         ));
-
-        let h_sharp = perceptual_hash(&sharp);
-        let h_sharp_again = perceptual_hash(&sharp);
-        let h_blurred = perceptual_hash(&blurred);
-
-        // Deterministic: same image -> same hash (distance 0).
-        assert_eq!(hash_distance(&h_sharp, &h_sharp_again).unwrap(), 0);
-        // Discriminating: a materially different image -> nonzero distance.
-        assert!(hash_distance(&h_sharp, &h_blurred).unwrap() > 0);
+        // A threshold between the two scores classifies each correctly.
+        let sharp_a = assess_blur(&sharp, 100.0);
+        let blurred_a = assess_blur(&blurred, 100.0);
+        println!("sharp={sharp_a:?} blurred={blurred_a:?}");
+        assert!(!sharp_a.is_blurry, "sharp should not be flagged blurry");
+        assert!(blurred_a.is_blurry, "blurred should be flagged blurry");
     }
 
     #[test]
@@ -237,23 +238,36 @@ mod tests {
         assert!(!is_raw_path(Path::new("noext")));
     }
 
-    /// Decodes a real RAW file when one is available. Ignored by default because
-    /// the test photo set doesn't exist yet. Run once you have RAW samples:
+    /// Decodes a real RAW file and confirms it produces a *viewable* image:
+    /// plausible dimensions, real content (non-trivial luma variance — a failed
+    /// decode tends to be uniform/black), and writes a PNG next to the RAW so you
+    /// can eyeball the result. Ignored until you supply a sample.
+    ///
+    /// NOTE: RAW decoding here is pure-Rust `rawloader` + `imagepipe`, NOT libraw.
     ///
     ///   $env:CULLING_TEST_RAW = "C:\path\to\photo.cr3"
     ///   cargo test -p tauri-app decode_real_raw -- --ignored --nocapture
     #[test]
-    #[ignore = "requires a RAW sample; set CULLING_TEST_RAW to enable"]
+    #[ignore = "requires a real RAW file; set CULLING_TEST_RAW"]
     fn decode_real_raw() {
-        let path = std::env::var("CULLING_TEST_RAW")
-            .expect("set CULLING_TEST_RAW to a RAW file path");
-        let img = decode_image(Path::new(&path)).expect("RAW decode failed");
-        assert!(img.width() > 0 && img.height() > 0);
-        println!(
-            "decoded RAW {}x{}, blur_score={:.2}",
-            img.width(),
-            img.height(),
-            blur_score(&img)
-        );
+        let path = std::env::var("CULLING_TEST_RAW").expect("set CULLING_TEST_RAW to a RAW file path");
+        let raw_path = Path::new(&path);
+        assert!(is_raw_path(raw_path), "CULLING_TEST_RAW should point to a RAW file");
+
+        let img = decode_image(raw_path).expect("RAW decode failed");
+        let (w, h) = (img.width(), img.height());
+        assert!(w >= 64 && h >= 64, "implausible RAW dimensions {w}x{h}");
+
+        // "Viewable" content check: real photos have luminance variation; a
+        // broken decode is typically uniform/black (Laplacian variance ~0).
+        let content = blur_score(&img);
+        assert!(content > 0.0, "decoded RAW looks uniform/blank (content score {content})");
+
+        // VALIDATE: eyeball this PNG — confirm correct colours (no R/B swap),
+        // orientation, and reasonable exposure/white balance from imagepipe.
+        let out = raw_path.with_extension("decoded.png");
+        img.save(&out).expect("failed to save decoded PNG");
+        println!("decoded RAW {w}x{h}, content score {content:.1}");
+        println!("wrote viewable PNG: {}", out.display());
     }
 }
