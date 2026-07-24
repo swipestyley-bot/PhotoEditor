@@ -1,7 +1,9 @@
 //! Run the full culling analysis (blur, duplicates/bursts, eyes-closed) over a
-//! folder of images and print a report.
+//! folder of images and print a report. Blur is measured both whole-frame and
+//! on the detected face region ("subject blur"), the latter being the effective
+//! verdict when a face is present.
 //!
-//!   cargo run --example analyze_folder -- <folder>   (default: ../test-photos)
+//!   cargo run --release --example analyze_folder -- <folder>   (default: ../test-photos)
 
 use std::path::{Path, PathBuf};
 
@@ -10,18 +12,27 @@ use tauri_app_lib::dedup::{
     Fingerprint, DEFAULT_BURST_GAP_SECS, DEFAULT_DUP_DISTANCE,
 };
 use tauri_app_lib::face::{EyesState, FacePipeline, DEFAULT_EAR_THRESHOLD};
-use tauri_app_lib::vision::{assess_blur, decode_image, DEFAULT_BLUR_THRESHOLD};
+use tauri_app_lib::vision::{assess_blur, decode_image, BlurAssessment, DEFAULT_BLUR_THRESHOLD};
 
 struct Row {
     name: String,
     w: u32,
     h: u32,
-    blur: f64,
-    blurry: bool,
+    frame_blur: f64,
+    frame_blurry: bool,
+    face_blur: Option<BlurAssessment>,
     phash: String,
     ts: Option<chrono::NaiveDateTime>,
     eyes: Option<EyesState>,
     face_err: Option<String>,
+}
+
+impl Row {
+    /// Effective blur verdict: subject-region blur when a face was found, else
+    /// whole-frame.
+    fn effective_blurry(&self) -> bool {
+        self.face_blur.map(|b| b.is_blurry).unwrap_or(self.frame_blurry)
+    }
 }
 
 fn is_image(p: &Path) -> bool {
@@ -60,17 +71,20 @@ fn main() {
                 continue;
             }
         };
-        let blur = assess_blur(&img, DEFAULT_BLUR_THRESHOLD);
-        let (eyes, face_err) = match pipe.analyze_primary_face(&img, DEFAULT_EAR_THRESHOLD) {
-            Ok(e) => (e, None),
-            Err(e) => (None, Some(e)),
-        };
+        let frame = assess_blur(&img, DEFAULT_BLUR_THRESHOLD);
+        // Single detection pass: subject-region blur + eyes.
+        let (eyes, face_blur, face_err) =
+            match pipe.analyze(&img, DEFAULT_EAR_THRESHOLD, DEFAULT_BLUR_THRESHOLD) {
+                Ok(a) => (a.eyes, a.face_blur, None),
+                Err(e) => (None, None, Some(e)),
+            };
         rows.push(Row {
             name,
             w: img.width(),
             h: img.height(),
-            blur: blur.score,
-            blurry: blur.is_blurry,
+            frame_blur: frame.score,
+            frame_blurry: frame.is_blurry,
+            face_blur,
             phash: perceptual_hash(&img),
             ts: exif_timestamp(p),
             eyes,
@@ -80,29 +94,36 @@ fn main() {
 
     let nw = rows.iter().map(|r| r.name.len()).max().unwrap_or(8).max(8);
 
-    // ---- Per-photo metrics ----
-    println!("== Per-photo metrics (blur threshold {DEFAULT_BLUR_THRESHOLD}) ==");
+    // ---- Blur: whole-frame vs subject region ----
+    println!("== Blur: whole-frame vs face region (threshold {DEFAULT_BLUR_THRESHOLD}) ==");
     for r in &rows {
-        let verdict = if r.blurry { "BLURRY" } else { "sharp " };
-        let ts = r
-            .ts
-            .map(|t| t.format("%Y-%m-%d %H:%M:%S").to_string())
-            .unwrap_or_else(|| "no-exif".into());
+        let subj = match r.face_blur {
+            Some(b) => format!("{:>8.1} ({})", b.score, if b.is_blurry { "blurry" } else { "sharp " }),
+            None => "  no-face        ".to_string(),
+        };
         println!(
-            "  {:<nw$}  blur {:>10.1}  {}  {:>4}x{:<5}  {}",
-            r.name, r.blur, verdict, r.w, r.h, ts, nw = nw
+            "  {:<nw$}  {:>4}x{:<4}  frame {:>8.1} ({})  subject {}  => {}",
+            r.name,
+            r.w,
+            r.h,
+            r.frame_blur,
+            if r.frame_blurry { "blurry" } else { "sharp " },
+            subj,
+            if r.effective_blurry() { "BLURRY" } else { "sharp" },
+            nw = nw
         );
     }
-    let mut scores: Vec<f64> = rows.iter().map(|r| r.blur).collect();
-    scores.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    if !scores.is_empty() {
+    let subj: Vec<f64> = rows.iter().filter_map(|r| r.face_blur.map(|b| b.score)).collect();
+    if !subj.is_empty() {
+        let mut s = subj.clone();
+        s.sort_by(|a, b| a.partial_cmp(b).unwrap());
         println!(
-            "  -- blur range: min {:.1} | median {:.1} | max {:.1}",
-            scores[0],
-            scores[scores.len() / 2],
-            scores[scores.len() - 1]
+            "  -- subject-blur range (faces): min {:.1} | median {:.1} | max {:.1}",
+            s[0], s[s.len() / 2], s[s.len() - 1]
         );
     }
+    let blurry = rows.iter().filter(|r| r.effective_blurry()).count();
+    println!("  -- effective verdict: {blurry}/{} blurry", rows.len());
 
     // ---- Nearest duplicate neighbour ----
     println!("\n== Nearest neighbour by pHash distance ==");
@@ -144,7 +165,10 @@ fn main() {
         .collect();
     let bursts = group_bursts(&fps, DEFAULT_BURST_GAP_SECS);
     let with_ts = rows.iter().filter(|r| r.ts.is_some()).count();
-    println!("\n== Bursts (capture-time gap <= {DEFAULT_BURST_GAP_SECS}s; {with_ts}/{} timestamped) ==", rows.len());
+    println!(
+        "\n== Bursts (capture-time gap <= {DEFAULT_BURST_GAP_SECS}s; {with_ts}/{} timestamped) ==",
+        rows.len()
+    );
     if with_ts == 0 {
         println!("  (no EXIF timestamps — cannot group bursts)");
     } else {

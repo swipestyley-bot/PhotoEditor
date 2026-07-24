@@ -145,6 +145,8 @@ mod pipeline {
     use ort::session::Session;
     use ort::value::TensorRef;
 
+    use crate::vision::{assess_blur_region_normalized, BlurAssessment};
+
     use super::{classify_eyes, EyesState, FaceBox, Point};
 
     /// YuNet's fixed square input side.
@@ -244,6 +246,15 @@ mod pipeline {
 
             Ok(nms(boxes, self.nms_threshold))
         }
+
+        /// The largest detected face, if any.
+        pub fn primary_face(&mut self, img: &DynamicImage) -> Result<Option<FaceBox>, String> {
+            Ok(self.detect(img)?.into_iter().max_by(|a, b| {
+                a.area()
+                    .partial_cmp(&b.area())
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            }))
+        }
     }
 
     /// Stage 2: MediaPipe FaceMesh landmark model.
@@ -308,8 +319,20 @@ mod pipeline {
         }
     }
 
+    /// Full per-photo face analysis: the largest face box, subject-region blur,
+    /// and eyes-closed. Fields are `None` when no face was detected.
+    #[derive(Debug, Clone, Copy, serde::Serialize)]
+    pub struct FaceAnalysis {
+        pub face: Option<FaceBox>,
+        pub eyes: Option<EyesState>,
+        /// Blur measured on the (scale-normalized) face region rather than the
+        /// whole frame, so a soft/bokeh background and the subject's distance from
+        /// camera don't skew the sharpness verdict.
+        pub face_blur: Option<BlurAssessment>,
+    }
+
     /// Both stages combined: detect the primary face, crop it, run landmarks,
-    /// classify eyes.
+    /// classify eyes, and measure subject-region blur.
     pub struct FacePipeline {
         detector: FaceDetector,
         landmarker: LandmarkModel,
@@ -326,24 +349,15 @@ mod pipeline {
             })
         }
 
-        /// Detect the largest face, run landmarks on it, and classify eyes.
-        /// Returns `Ok(None)` when no face passes the detector.
-        pub fn analyze_primary_face(
+        /// Run FaceMesh on a detected face box and classify its eyes.
+        fn eyes_for_face(
             &mut self,
             img: &DynamicImage,
+            face: &FaceBox,
             ear_threshold: f32,
-        ) -> Result<Option<EyesState>, String> {
-            let faces = self.detector.detect(img)?;
-            let Some(face) = faces
-                .into_iter()
-                .max_by(|a, b| a.area().partial_cmp(&b.area()).unwrap_or(std::cmp::Ordering::Equal))
-            else {
-                return Ok(None);
-            };
-
-            let (crop, rect) = crop_face(img, &face, 0.25);
+        ) -> Result<EyesState, String> {
+            let (crop, rect) = crop_face(img, face, 0.25);
             let (lm192, _score) = self.landmarker.landmarks(&crop)?;
-
             // Map 192-space landmarks back to original-image coordinates.
             let (x0, y0, cw, ch) = rect;
             let landmarks: Vec<Point> = lm192
@@ -353,8 +367,55 @@ mod pipeline {
                     y: y0 + p.y / FACEMESH_INPUT as f32 * ch,
                 })
                 .collect();
+            classify_eyes(&landmarks, ear_threshold)
+        }
 
-            Ok(Some(classify_eyes(&landmarks, ear_threshold)?))
+        /// Detect the largest face, run landmarks on it, and classify eyes.
+        /// Returns `Ok(None)` when no face passes the detector.
+        pub fn analyze_primary_face(
+            &mut self,
+            img: &DynamicImage,
+            ear_threshold: f32,
+        ) -> Result<Option<EyesState>, String> {
+            match self.detector.primary_face(img)? {
+                Some(face) => Ok(Some(self.eyes_for_face(img, &face, ear_threshold)?)),
+                None => Ok(None),
+            }
+        }
+
+        /// Full per-photo analysis in a single detection pass: subject-region
+        /// blur + eyes-closed for the largest face (all `None` if no face found).
+        pub fn analyze(
+            &mut self,
+            img: &DynamicImage,
+            ear_threshold: f32,
+            blur_threshold: f64,
+        ) -> Result<FaceAnalysis, String> {
+            let Some(face) = self.detector.primary_face(img)? else {
+                return Ok(FaceAnalysis {
+                    face: None,
+                    eyes: None,
+                    face_blur: None,
+                });
+            };
+            // Expand the face box ~10% to include sharp facial detail (eyes, brows).
+            // Scale-normalized so a close-up (portrait) face and a distant face of
+            // equal true sharpness score comparably.
+            let m = 0.1;
+            let face_blur = Some(assess_blur_region_normalized(
+                img,
+                (face.x - m * face.w).max(0.0) as u32,
+                (face.y - m * face.h).max(0.0) as u32,
+                (face.w * (1.0 + 2.0 * m)) as u32,
+                (face.h * (1.0 + 2.0 * m)) as u32,
+                blur_threshold,
+            ));
+            let eyes = Some(self.eyes_for_face(img, &face, ear_threshold)?);
+            Ok(FaceAnalysis {
+                face: Some(face),
+                eyes,
+                face_blur,
+            })
         }
     }
 
@@ -397,7 +458,7 @@ mod pipeline {
     }
 }
 
-pub use pipeline::{FaceDetector, FacePipeline, LandmarkModel};
+pub use pipeline::{FaceAnalysis, FaceDetector, FacePipeline, LandmarkModel};
 
 /// Tauri command: detect the primary face in an image and classify eyes-closed.
 /// Loads both ONNX models per call. Returns `None` if no face is found.

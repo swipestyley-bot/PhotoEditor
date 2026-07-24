@@ -10,7 +10,7 @@
 
 use std::path::Path;
 
-use image::{DynamicImage, GrayImage};
+use image::{imageops::FilterType, DynamicImage, GrayImage};
 use serde::Serialize;
 
 /// File extensions we route through the RAW decoder rather than the standard
@@ -104,6 +104,78 @@ pub struct BlurAssessment {
 /// (see [`DEFAULT_BLUR_THRESHOLD`]).
 pub fn assess_blur(img: &DynamicImage, threshold: f64) -> BlurAssessment {
     let score = blur_score(img);
+    BlurAssessment {
+        score,
+        is_blurry: score < threshold,
+    }
+}
+
+/// Clamp a sub-rectangle to the image bounds and return that crop, or `None`
+/// for a zero-sized image.
+fn clamp_crop(img: &DynamicImage, x: u32, y: u32, w: u32, h: u32) -> Option<DynamicImage> {
+    let (iw, ih) = (img.width(), img.height());
+    if iw == 0 || ih == 0 {
+        return None;
+    }
+    let x = x.min(iw - 1);
+    let y = y.min(ih - 1);
+    let w = w.min(iw - x).max(1);
+    let h = h.min(ih - y).max(1);
+    Some(img.crop_imm(x, y, w, h))
+}
+
+/// Canonical long-edge (px) that normalized blur scores resize to before
+/// measuring. Variance-of-Laplacian is **scale-dependent**: a sharp close-up
+/// face is mostly smooth-skin pixels that dilute its few edges, so it scores far
+/// lower than an equally sharp *distant* face whose edges are packed densely.
+/// Cross-photo comparison therefore has to normalize scale first. 400px was
+/// calibrated on the test set — it collapses the close-up-vs-distant gap while
+/// only ever downscaling real face crops (never upscaling, which would inject
+/// interpolation blur).
+pub const BLUR_NORM_LONG_EDGE: u32 = 400;
+
+/// Downscale `img` so its long edge is at most [`BLUR_NORM_LONG_EDGE`]. Crops
+/// already at/under that size pass through unchanged (no upscaling).
+fn normalize_for_blur(img: &DynamicImage) -> DynamicImage {
+    if img.width().max(img.height()) > BLUR_NORM_LONG_EDGE {
+        img.resize(BLUR_NORM_LONG_EDGE, BLUR_NORM_LONG_EDGE, FilterType::Lanczos3)
+    } else {
+        img.clone()
+    }
+}
+
+/// Raw variance-of-Laplacian over a sub-rectangle (clamped to bounds).
+///
+/// NOTE: this is **scale-dependent** (see [`BLUR_NORM_LONG_EDGE`]) — prefer
+/// [`blur_score_region_normalized`] when comparing scores across photos. Kept as
+/// a building block and for diagnostics.
+pub fn blur_score_region(img: &DynamicImage, x: u32, y: u32, w: u32, h: u32) -> f64 {
+    clamp_crop(img, x, y, w, h)
+        .map(|c| blur_score(&c))
+        .unwrap_or(0.0)
+}
+
+/// Scale-normalized blur score over a sub-rectangle: crop the region (e.g. a
+/// detected face box), normalize its size ([`normalize_for_blur`]), then measure
+/// variance-of-Laplacian. This makes a close-up and a distant face of equal true
+/// sharpness score comparably, which is what fixes portrait-mode false positives.
+pub fn blur_score_region_normalized(img: &DynamicImage, x: u32, y: u32, w: u32, h: u32) -> f64 {
+    clamp_crop(img, x, y, w, h)
+        .map(|c| blur_score(&normalize_for_blur(&c)))
+        .unwrap_or(0.0)
+}
+
+/// [`assess_blur`] over a scale-normalized sub-rectangle (see
+/// [`blur_score_region_normalized`]).
+pub fn assess_blur_region_normalized(
+    img: &DynamicImage,
+    x: u32,
+    y: u32,
+    w: u32,
+    h: u32,
+    threshold: f64,
+) -> BlurAssessment {
+    let score = blur_score_region_normalized(img, x, y, w, h);
     BlurAssessment {
         score,
         is_blurry: score < threshold,

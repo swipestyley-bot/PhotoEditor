@@ -22,9 +22,10 @@ const PHASH_SIZE: u32 = 8;
 
 /// Default Hamming distance below which two pHashes are treated as
 /// near-duplicates.
-/// VALIDATE: tune on real photos. For 64-bit pHash, re-encoded/exact copies are
-/// typically <= ~4 and visually near-identical frames <= ~10.
-pub const DEFAULT_DUP_DISTANCE: u32 = 10;
+/// Calibrated on real photos: exact/re-encoded copies score 0, and a genuine
+/// near-dup pair in the test set sat at 12, so 12 captures near-dups while
+/// distinct frames stay >= ~22. VALIDATE: re-check on a larger set.
+pub const DEFAULT_DUP_DISTANCE: u32 = 12;
 
 /// Default max gap between consecutive frames considered part of one burst.
 /// VALIDATE: tune to your camera's burst rate (e.g. 0.1s for 10fps bursts).

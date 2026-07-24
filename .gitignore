@@ -16,6 +16,9 @@ dist-ssr
 /runtime/
 /models/
 
+# Generated diagnostic output (face-region crops from examples/dump_face_crops)
+/face-crops/
+
 # Editor directories and files
 .vscode/*
 !.vscode/extensions.json
