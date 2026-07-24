@@ -11,7 +11,7 @@
 //! clamped highlights/shadows. Geometry (straighten) runs first, sharpening
 //! (needs neighbours) runs last on the 8-bit image.
 
-use image::{DynamicImage, Rgb, RgbImage};
+use image::{imageops::FilterType, DynamicImage, Rgb, RgbImage};
 use serde::Deserialize;
 
 /// Per-photo edit settings. Auto strengths are 0..100; manual sliders are
@@ -35,6 +35,26 @@ pub struct EditParams {
     pub tint: f32,
     pub sharpening: f32,
     pub straighten: f32,
+    /// Crop rect, normalized 0..1 of the straightened frame. A full-frame rect
+    /// (the default all-zero) means "no crop".
+    pub crop_x: f32,
+    pub crop_y: f32,
+    pub crop_w: f32,
+    pub crop_h: f32,
+    /// Noise reduction strength 0..100 (median blend).
+    pub noise_reduction: f32,
+    /// Local-contrast clarity -100..100.
+    pub clarity: f32,
+    /// Vignette: negative darkens edges, positive lightens (-100..100).
+    pub vignette_amount: f32,
+    /// Vignette midpoint 0..100 (where the falloff starts).
+    pub vignette_midpoint: f32,
+    /// Split toning: shadow hue 0..360 / saturation 0..100.
+    pub shadow_hue: f32,
+    pub shadow_sat: f32,
+    /// Split toning: highlight hue 0..360 / saturation 0..100.
+    pub highlight_hue: f32,
+    pub highlight_sat: f32,
 }
 
 impl Default for EditParams {
@@ -55,21 +75,47 @@ impl Default for EditParams {
             tint: 0.0,
             sharpening: 0.0,
             straighten: 0.0,
+            crop_x: 0.0,
+            crop_y: 0.0,
+            crop_w: 0.0,
+            crop_h: 0.0,
+            noise_reduction: 0.0,
+            clarity: 0.0,
+            vignette_amount: 0.0,
+            vignette_midpoint: 0.0,
+            shadow_hue: 0.0,
+            shadow_sat: 0.0,
+            highlight_hue: 0.0,
+            highlight_sat: 0.0,
         }
     }
 }
 
 impl EditParams {
-    /// True when nothing would change the image (all sliders at 0).
+    /// True when nothing would change the image (all sliders at 0 and no crop).
     pub fn is_noop(&self) -> bool {
-        [
-            self.auto_exposure, self.auto_white_balance, self.auto_contrast,
-            self.exposure, self.contrast, self.highlights, self.shadows,
-            self.whites, self.blacks, self.saturation, self.vibrance,
-            self.temperature, self.tint, self.sharpening, self.straighten,
-        ]
-        .iter()
-        .all(|v| v.abs() < 0.01)
+        !self.crop_active()
+            && [
+                self.auto_exposure, self.auto_white_balance, self.auto_contrast,
+                self.exposure, self.contrast, self.highlights, self.shadows,
+                self.whites, self.blacks, self.saturation, self.vibrance,
+                self.temperature, self.tint, self.sharpening, self.straighten,
+                self.noise_reduction, self.clarity, self.vignette_amount,
+                self.vignette_midpoint, self.shadow_hue, self.shadow_sat,
+                self.highlight_hue, self.highlight_sat,
+            ]
+            .iter()
+            .all(|v| v.abs() < 0.01)
+    }
+
+    /// True when the crop rect is set to something other than the full frame.
+    pub fn crop_active(&self) -> bool {
+        self.crop_w > 0.001
+            && self.crop_h > 0.001
+            && (self.crop_x > 0.001
+                || self.crop_y > 0.001
+                || self.crop_w < 0.999
+                || self.crop_h < 0.999)
     }
 }
 
@@ -279,8 +325,11 @@ fn inscribed_rect(w: f32, h: f32, angle: f32) -> (f32, f32) {
     }
 }
 
-fn straighten(img: &DynamicImage, slider: f32) -> DynamicImage {
-    let deg = bipolar(slider) * STRAIGHTEN_MAX_DEG;
+/// Straighten: rotate by the slider's angle and crop to the largest upright
+/// rectangle containing no rotated-out (blank) corners. Runs before the user
+/// crop, so the crop can never include blank area.
+pub fn straighten(img: &DynamicImage, p: EditParams) -> DynamicImage {
+    let deg = bipolar(p.straighten) * STRAIGHTEN_MAX_DEG;
     if deg.abs() < 0.01 {
         return img.clone();
     }
@@ -294,11 +343,26 @@ fn straighten(img: &DynamicImage, slider: f32) -> DynamicImage {
         imageproc::geometric_transformations::Border::Constant(Rgb([0, 0, 0])),
     );
     let (cw, ch) = inscribed_rect(w as f32, h as f32, theta.abs());
-    let cw = (cw.floor() as u32).min(w).max(1);
-    let ch = (ch.floor() as u32).min(h).max(1);
+    // Inset ~1.5% so no thin black edge from the rotation boundary survives.
+    let cw = ((cw * 0.985).floor() as u32).min(w).max(1);
+    let ch = ((ch * 0.985).floor() as u32).min(h).max(1);
     let x0 = (w - cw) / 2;
     let y0 = (h - ch) / 2;
     DynamicImage::ImageRgb8(image::imageops::crop_imm(&rotated, x0, y0, cw, ch).to_image())
+}
+
+/// Apply the user crop rect (normalized 0..1 of the straightened frame). A rect
+/// covering the full frame (the default) is a no-op.
+pub fn crop(img: &DynamicImage, p: EditParams) -> DynamicImage {
+    if !p.crop_active() {
+        return img.clone();
+    }
+    let (w, h) = (img.width(), img.height());
+    let x = (p.crop_x.clamp(0.0, 1.0) * w as f32) as u32;
+    let y = (p.crop_y.clamp(0.0, 1.0) * h as f32) as u32;
+    let cw = ((p.crop_w * w as f32).round() as u32).min(w.saturating_sub(x)).max(1);
+    let ch = ((p.crop_h * h as f32).round() as u32).min(h.saturating_sub(y)).max(1);
+    DynamicImage::ImageRgb8(image::imageops::crop_imm(&img.to_rgb8(), x, y, cw, ch).to_image())
 }
 
 fn sharpen(rgb: &mut RgbImage, amount: f32) {
@@ -315,13 +379,118 @@ fn sharpen(rgb: &mut RgbImage, amount: f32) {
     }
 }
 
+// --- noise / clarity / vignette / split toning ------------------------------
+
+/// Median-filter denoise, blended with the original by `strength` (0..100).
+fn denoise(img: &DynamicImage, strength: f32) -> DynamicImage {
+    let s = strength01(strength);
+    if s <= 0.0 {
+        return img.clone();
+    }
+    let mut rgb = img.to_rgb8();
+    let radius = if strength >= 60.0 { 2 } else { 1 };
+    let med = imageproc::filter::median_filter(&rgb, radius, radius);
+    for (o, m) in rgb.pixels_mut().zip(med.pixels()) {
+        for c in 0..3 {
+            o[c] = (o[c] as f32 + (m[c] as f32 - o[c] as f32) * s).round().clamp(0.0, 255.0) as u8;
+        }
+    }
+    DynamicImage::ImageRgb8(rgb)
+}
+
+/// Large-radius blur, approximated by down/up-sampling so a big sigma stays fast
+/// even on full-resolution exports.
+fn large_blur(rgb: &RgbImage, sigma: f32) -> RgbImage {
+    if sigma <= 6.0 {
+        return imageproc::filter::gaussian_blur_f32(rgb, sigma);
+    }
+    let scale = (sigma / 4.0).clamp(1.0, 8.0);
+    let sw = (rgb.width() as f32 / scale).max(1.0) as u32;
+    let sh = (rgb.height() as f32 / scale).max(1.0) as u32;
+    let small = image::imageops::resize(rgb, sw, sh, FilterType::Triangle);
+    let blurred = imageproc::filter::gaussian_blur_f32(&small, sigma / scale);
+    image::imageops::resize(&blurred, rgb.width(), rgb.height(), FilterType::Triangle)
+}
+
+/// Clarity: local (midtone) contrast via a large-radius unsharp mask (-1..1).
+fn clarity(rgb: &mut RgbImage, amount: f32) {
+    if amount == 0.0 {
+        return;
+    }
+    let (w, h) = rgb.dimensions();
+    let sigma = ((w.min(h) as f32) / 60.0).clamp(4.0, 60.0);
+    let blurred = large_blur(rgb, sigma);
+    let k = amount * 0.6;
+    for (o, b) in rgb.pixels_mut().zip(blurred.pixels()) {
+        for c in 0..3 {
+            let v = o[c] as f32 + k * (o[c] as f32 - b[c] as f32);
+            o[c] = v.round().clamp(0.0, 255.0) as u8;
+        }
+    }
+}
+
+/// Radial vignette in the working buffer. `amount` -1..1 (negative darkens the
+/// edges), `midpoint` 0..1 where the falloff begins.
+fn vignette_buf(buf: &mut [f32], w: u32, h: u32, amount: f32, midpoint: f32) {
+    if amount == 0.0 {
+        return;
+    }
+    let (cx, cy) = (w as f32 / 2.0, h as f32 / 2.0);
+    let maxd = (cx * cx + cy * cy).sqrt().max(1.0);
+    for (i, px) in buf.chunks_exact_mut(3).enumerate() {
+        let x = (i as u32 % w) as f32;
+        let y = (i as u32 / w) as f32;
+        let d = (((x - cx).powi(2) + (y - cy).powi(2)).sqrt()) / maxd;
+        let t = smoothstep(midpoint, 1.0, d);
+        let factor = 1.0 + amount * 0.8 * t;
+        px[0] *= factor;
+        px[1] *= factor;
+        px[2] *= factor;
+    }
+}
+
+fn hue_to_rgb(hue_deg: f32) -> [f32; 3] {
+    // Fully saturated colour at the given hue (HSL s=1, l=0.5).
+    let h = (hue_deg.rem_euclid(360.0)) / 60.0;
+    let x = 1.0 - (h % 2.0 - 1.0).abs();
+    let (r, g, b) = match h as u32 {
+        0 => (1.0, x, 0.0),
+        1 => (x, 1.0, 0.0),
+        2 => (0.0, 1.0, x),
+        3 => (0.0, x, 1.0),
+        4 => (x, 0.0, 1.0),
+        _ => (1.0, 0.0, x),
+    };
+    [r, g, b]
+}
+
+/// Split toning: tint shadows and highlights toward separate hues, weighted by
+/// luminance.
+fn split_tone_buf(buf: &mut [f32], sh_hue: f32, sh_sat: f32, hi_hue: f32, hi_sat: f32) {
+    let sh_amt = (sh_sat / 100.0).clamp(0.0, 1.0) * 0.5;
+    let hi_amt = (hi_sat / 100.0).clamp(0.0, 1.0) * 0.5;
+    if sh_amt <= 0.0 && hi_amt <= 0.0 {
+        return;
+    }
+    let sh = hue_to_rgb(sh_hue);
+    let hi = hue_to_rgb(hi_hue);
+    for px in buf.chunks_exact_mut(3) {
+        let l = lum(px).clamp(0.0, 1.0);
+        let ws = (1.0 - l) * sh_amt;
+        let wh = l * hi_amt;
+        for c in 0..3 {
+            px[c] += ws * (sh[c] - 0.5) + wh * (hi[c] - 0.5);
+        }
+    }
+}
+
 // --- public entry points ---------------------------------------------------
 
-/// Full edit pipeline: geometry → white balance → exposure → tone →
+/// Color/tone/detail stage (no geometry): white balance → exposure → tone →
 /// color → sharpening. Order mirrors a typical raw editor.
-pub fn auto_edit(img: &DynamicImage, p: EditParams) -> DynamicImage {
-    let geo = straighten(img, p.straighten);
-    let rgb = geo.to_rgb8();
+pub fn color(img: &DynamicImage, p: EditParams) -> DynamicImage {
+    let base = denoise(img, p.noise_reduction);
+    let rgb = base.to_rgb8();
     let (w, h) = rgb.dimensions();
     let mut buf = to_buf(&rgb);
 
@@ -341,11 +510,19 @@ pub fn auto_edit(img: &DynamicImage, p: EditParams) -> DynamicImage {
         bipolar(p.blacks),
     );
 
+    split_tone_buf(&mut buf, p.shadow_hue, p.shadow_sat, p.highlight_hue, p.highlight_sat);
     manual_color(&mut buf, bipolar(p.saturation), bipolar(p.vibrance));
+    vignette_buf(&mut buf, w, h, bipolar(p.vignette_amount), (p.vignette_midpoint / 100.0).clamp(0.0, 1.0));
 
     let mut out = from_buf(&buf, w, h); // clamps to [0,1] here
+    clarity(&mut out, bipolar(p.clarity));
     sharpen(&mut out, strength01(p.sharpening));
     DynamicImage::ImageRgb8(out)
+}
+
+/// Full pipeline: straighten → color → crop.
+pub fn auto_edit(img: &DynamicImage, p: EditParams) -> DynamicImage {
+    crop(&color(&straighten(img, p), p), p)
 }
 
 /// Auto-exposure only (0..100 strength) — used by tests/diagnostics.
@@ -475,6 +652,14 @@ mod tests {
                 temperature: 60.0,
                 tint: -40.0,
                 sharpening: 100.0,
+                noise_reduction: 80.0,
+                clarity: 70.0,
+                vignette_amount: -60.0,
+                vignette_midpoint: 40.0,
+                shadow_hue: 220.0,
+                shadow_sat: 60.0,
+                highlight_hue: 40.0,
+                highlight_sat: 60.0,
                 ..params()
             },
         )
@@ -494,6 +679,81 @@ mod tests {
         // rotate+inscribed-crop yields a smaller frame than the original
         assert!(out.width() < 96 && out.height() < 64, "straighten should crop in: {}x{}", out.width(), out.height());
         assert!(out.width() > 40 && out.height() > 25, "crop too aggressive: {}x{}", out.width(), out.height());
+    }
+
+    #[test]
+    fn crop_reduces_to_rect() {
+        let img = gradient(); // 96x64
+        let out = auto_edit(&img, EditParams { crop_x: 0.25, crop_y: 0.25, crop_w: 0.5, crop_h: 0.5, ..params() });
+        assert!((out.width() as i32 - 48).abs() <= 2, "w {}", out.width());
+        assert!((out.height() as i32 - 32).abs() <= 2, "h {}", out.height());
+    }
+
+    #[test]
+    fn crop_full_frame_is_noop() {
+        let img = gradient();
+        let out = auto_edit(&img, EditParams { crop_x: 0.0, crop_y: 0.0, crop_w: 1.0, crop_h: 1.0, ..params() });
+        assert_eq!(out.width(), 96);
+        assert_eq!(out.height(), 64);
+    }
+
+    /// Rotating then cropping must not leave rotated-out (black) corners in the
+    /// output — straighten's inscribed auto-crop removes them before the crop.
+    #[test]
+    fn rotate_plus_crop_has_no_blank() {
+        let img = gradient();
+        let out = auto_edit(
+            &img,
+            EditParams { straighten: 100.0, crop_x: 0.1, crop_y: 0.1, crop_w: 0.8, crop_h: 0.8, ..params() },
+        )
+        .to_rgb8();
+        assert!(out.width() > 10 && out.height() > 10, "empty result");
+        let black = out.pixels().filter(|p| p[0] < 3 && p[1] < 3 && p[2] < 3).count();
+        let frac = black as f32 / (out.width() * out.height()) as f32;
+        assert!(frac < 0.02, "rotate+crop left blank pixels: {frac}");
+    }
+
+    #[test]
+    fn vignette_darkens_corners() {
+        let img = solid(140, 140, 140);
+        let out = auto_edit(&img, EditParams { vignette_amount: -100.0, vignette_midpoint: 0.0, ..params() }).to_rgb8();
+        let center = out.get_pixel(out.width() / 2, out.height() / 2)[0] as i32;
+        let corner = out.get_pixel(0, 0)[0] as i32;
+        assert!(center - corner > 15, "center {center} brighter than corner {corner}");
+    }
+
+    #[test]
+    fn split_tone_tints_shadows() {
+        let img = solid(60, 60, 60); // dark = shadows
+        let p = auto_edit(&img, EditParams { shadow_hue: 0.0, shadow_sat: 100.0, ..params() }).to_rgb8();
+        let px = p.get_pixel(0, 0);
+        assert!(px[0] as i32 > px[2] as i32 + 8, "red shadow tint: {px:?}");
+    }
+
+    #[test]
+    fn denoise_reduces_variance() {
+        let noisy = DynamicImage::ImageRgb8(RgbImage::from_fn(48, 48, |x, y| {
+            let n = (x * 31 + y * 17) % 11; // sparse salt-and-pepper on a flat field
+            let v = if n == 0 { 255u8 } else if n == 1 { 0u8 } else { 128u8 };
+            Rgb([v, v, v])
+        }));
+        let std = |im: &DynamicImage| {
+            let r = im.to_rgb8();
+            let n = (r.width() * r.height()) as f32;
+            let (mut s, mut ss) = (0.0f32, 0.0f32);
+            for p in r.pixels() { let l = p[0] as f32; s += l; ss += l * l; }
+            let m = s / n;
+            (ss / n - m * m).max(0.0).sqrt()
+        };
+        let before = std(&noisy);
+        let after = std(&auto_edit(&noisy, EditParams { noise_reduction: 100.0, ..params() }));
+        assert!(after < before * 0.85, "denoise should cut variance: {before} -> {after}");
+    }
+
+    #[test]
+    fn clarity_runs_and_stays_valid() {
+        let out = auto_edit(&gradient(), EditParams { clarity: 80.0, ..params() }).to_rgb8().into_raw();
+        assert!(*out.iter().max().unwrap() > *out.iter().min().unwrap());
     }
 
     // --- auto-only behaviour (unchanged engine) ---

@@ -80,6 +80,14 @@ fn main() {
         temperature: 25.0,
         tint: -12.0,
         sharpening: 60.0,
+        noise_reduction: 40.0,
+        clarity: 55.0,
+        vignette_amount: -55.0,
+        vignette_midpoint: 45.0,
+        shadow_hue: 220.0,
+        shadow_sat: 45.0,
+        highlight_hue: 42.0,
+        highlight_sat: 45.0,
         ..EditParams::default()
     };
 
@@ -134,6 +142,28 @@ fn main() {
         one(|v| EditParams { whites: v, ..Default::default() }, "whites");
         one(|v| EditParams { blacks: v, ..Default::default() }, "blacks");
         println!("  (saturation/vibrance/temperature/tint verified separately — they hold luma ~constant)");
+    }
+
+    // Crop + rotation combos — must stay non-blank and sensibly sized.
+    if let Some(p) = paths.first() {
+        let img = decode_image(p).unwrap();
+        let blank = |im: &DynamicImage| {
+            let r = im.to_rgb8();
+            let b = r.pixels().filter(|px| px[0] < 3 && px[1] < 3 && px[2] < 3).count();
+            b as f32 / (r.width() * r.height()) as f32 * 100.0
+        };
+        println!("\nCrop / rotation combos on {}:", p.file_name().unwrap().to_string_lossy());
+        let cases: [(&str, EditParams); 4] = [
+            ("crop 60% center", EditParams { crop_x: 0.2, crop_y: 0.2, crop_w: 0.6, crop_h: 0.6, ..Default::default() }),
+            ("crop wide 16:9-ish", EditParams { crop_x: 0.0, crop_y: 0.2, crop_w: 1.0, crop_h: 0.56, ..Default::default() }),
+            ("straighten +100 + crop", EditParams { straighten: 100.0, crop_x: 0.1, crop_y: 0.1, crop_w: 0.8, crop_h: 0.8, ..Default::default() }),
+            ("straighten -60 + crop + edit", EditParams { straighten: -60.0, exposure: 30.0, saturation: 30.0, crop_x: 0.05, crop_y: 0.05, crop_w: 0.9, crop_h: 0.9, ..Default::default() }),
+        ];
+        for (name, prm) in cases {
+            let out = auto_edit(&img, prm);
+            let ok = out.width() > 50 && out.height() > 50 && blank(&out) < 1.0;
+            println!("  {:<30} -> {}x{}  blank {:.2}%  {}", name, out.width(), out.height(), blank(&out), if ok { "ok" } else { "BAD" });
+        }
     }
 
     // Save before/after samples (first 4 photos) with the combined edit.

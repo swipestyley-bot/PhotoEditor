@@ -35,7 +35,8 @@ pub fn run() {
             library::analyze_files,
             library::export_selects,
             library::preview_edit,
-            library::large_preview
+            library::large_preview,
+            library::read_exif
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

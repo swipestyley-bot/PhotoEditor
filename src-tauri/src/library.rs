@@ -129,6 +129,40 @@ pub fn large_preview(path: String) -> Result<String, String> {
     encode_jpeg_quality(&img.thumbnail(REVIEW_MAX, REVIEW_MAX), 88)
 }
 
+/// Camera settings from a photo's EXIF, formatted for display.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExifInfo {
+    pub camera: Option<String>,
+    pub lens: Option<String>,
+    pub iso: Option<String>,
+    pub aperture: Option<String>,
+    pub shutter: Option<String>,
+    pub focal_length: Option<String>,
+}
+
+/// Read camera settings (ISO, aperture, shutter, focal length, model) from EXIF.
+#[tauri::command]
+pub fn read_exif(path: String) -> Result<ExifInfo, String> {
+    let file = std::fs::File::open(&path).map_err(|e| format!("open {path}: {e}"))?;
+    let mut reader = std::io::BufReader::new(file);
+    let exif = exif::Reader::new()
+        .read_from_container(&mut reader)
+        .map_err(|e| format!("no readable EXIF: {e}"))?;
+    let get = |tag: exif::Tag| {
+        exif.get_field(tag, exif::In::PRIMARY)
+            .map(|f| f.display_value().with_unit(&exif).to_string())
+    };
+    Ok(ExifInfo {
+        camera: get(exif::Tag::Model),
+        lens: get(exif::Tag::LensModel),
+        iso: get(exif::Tag::PhotographicSensitivity),
+        aperture: get(exif::Tag::FNumber),
+        shutter: get(exif::Tag::ExposureTime),
+        focal_length: get(exif::Tag::FocalLength),
+    })
+}
+
 /// Resolve the ONNX models directory. Dev-only: bakes the build machine's
 /// `<repo>/models` path (`CARGO_MANIFEST_DIR` is `<repo>/src-tauri`).
 /// TODO(bundle): ship the models as Tauri resources and resolve them via the
@@ -404,29 +438,44 @@ pub struct PreviewPair {
     pub after: String,
 }
 
-/// Cache of decoded preview-size originals (+ their encoded "before" data URI),
-/// keyed by path, so dragging a slider re-renders without re-reading the file.
-fn preview_cache() -> &'static Mutex<HashMap<String, (Arc<DynamicImage>, String)>> {
-    static CACHE: OnceLock<Mutex<HashMap<String, (Arc<DynamicImage>, String)>>> = OnceLock::new();
+/// Cache of decoded preview-size originals, keyed by path, so dragging a slider
+/// re-renders without re-reading the file.
+fn preview_cache() -> &'static Mutex<HashMap<String, Arc<DynamicImage>>> {
+    static CACHE: OnceLock<Mutex<HashMap<String, Arc<DynamicImage>>>> = OnceLock::new();
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-/// Render a before/after edit preview for a single photo at preview size. The
-/// decoded preview image is cached per path, so real-time slider drags only pay
-/// for the edit + JPEG encode, not a fresh decode from disk.
+/// Render a before/after edit preview for a single photo at preview size.
+/// `before` is geometry-only (straighten [+ crop]) and `after` is the full edit,
+/// so hold-to-compare shows the color change at the same framing. When
+/// `crop_preview` is true the crop is NOT applied and full straightened frames
+/// are returned, so the UI can overlay the crop box. The decoded preview image
+/// is cached per path so real-time drags only pay for edit + encode.
 #[tauri::command]
-pub fn preview_edit(path: String, params: crate::edit::EditParams) -> Result<PreviewPair, String> {
-    let (img, before) = {
+pub fn preview_edit(
+    path: String,
+    params: crate::edit::EditParams,
+    crop_preview: bool,
+) -> Result<PreviewPair, String> {
+    let img = {
         let mut cache = preview_cache().lock().map_err(|e| format!("cache lock: {e}"))?;
-        if let Some((img, before)) = cache.get(&path) {
-            (img.clone(), before.clone())
+        if let Some(img) = cache.get(&path) {
+            img.clone()
         } else {
             let small = Arc::new(decode_image(Path::new(&path))?.thumbnail(PREVIEW_MAX, PREVIEW_MAX));
-            let before = encode_jpeg_data_uri(&small)?;
-            cache.insert(path.clone(), (small.clone(), before.clone()));
-            (small, before)
+            cache.insert(path.clone(), small.clone());
+            small
         }
     };
-    let after = encode_jpeg_data_uri(&crate::edit::auto_edit(&img, params))?;
-    Ok(PreviewPair { before, after })
+    let straightened = crate::edit::straighten(&img, params);
+    let colored = crate::edit::color(&straightened, params);
+    let (before_img, after_img) = if crop_preview {
+        (straightened, colored)
+    } else {
+        (crate::edit::crop(&straightened, params), crate::edit::crop(&colored, params))
+    };
+    Ok(PreviewPair {
+        before: encode_jpeg_data_uri(&before_img)?,
+        after: encode_jpeg_data_uri(&after_img)?,
+    })
 }
