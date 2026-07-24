@@ -1,32 +1,24 @@
-//! Face landmark detection + eyes-closed classification via ONNX Runtime (`ort`).
+//! Face detection + landmark-based eyes-closed detection.
 //!
-//! ## Design
+//! Two-stage ONNX pipeline (both models load via `ort`, dynamic-linked):
+//!   1. **YuNet** (`models/face_detection_yunet_2023mar.onnx`, MIT) — detects
+//!      face bounding boxes.
+//!   2. **MediaPipe FaceMesh** (`models/face_landmarker.onnx`, Apache-2.0) —
+//!      478/468-point landmark mesh on the cropped face.
+//! Eyes-open/closed is derived from the eye landmarks via **Eye Aspect Ratio
+//! (EAR)**, using MediaPipe mesh indices.
 //!
-//! The *decision* logic — Eye Aspect Ratio (EAR) and the open/closed threshold —
-//! is pure and fully unit-tested here (see `tests`). It does not depend on any
-//! model and is the actual "eyes-closed" algorithm used by dlib/OpenCV tutorials.
+//! See [`docs/MODELS.md`](../../docs/MODELS.md) for model sourcing/licensing.
 //!
-//! The *inference* half ([`LandmarkDetector`]) wraps an `ort` session that runs a
-//! **68-point facial-landmark ONNX model** and maps its output onto that EAR
-//! logic. It compiles and is structured against the real `ort` 2.0 API, but it
-//! is **not yet validated end-to-end** because we don't have a model file or a
-//! face photo in the test set. The exact input/output contract a given model
-//! expects varies, so [`ModelConfig`] exposes the knobs (input size, channel
-//! order, normalization, output coordinate space). Validate against your chosen
-//! model via the ignored `detect_real_face` integration test.
+//! ## Validation status
 //!
-//! ## Getting a model
-//!
-//! You need a landmark model that emits the classic **dlib 68-point** layout
-//! (eyes at indices 36–41 and 42–47). Options:
-//!   * Convert dlib's `shape_predictor_68_face_landmarks` to ONNX, or
-//!   * Use a pretrained 68-pt ONNX (e.g. from the PIPNet / FAN / 3DDFA families).
-//!
-//! These landmark models expect an already-cropped, roughly-centered face. In a
-//! full pipeline you'd run a face *detector* first (e.g. YuNet/SCRFD ONNX) to get
-//! the crop; here `detect_landmarks` assumes the passed image is that crop (or a
-//! full frame with a single centered face). Wiring the detector stage is the
-//! natural next step once this half is validated.
+//! The pure EAR/classification logic is unit-tested. The ONNX inference halves
+//! ([`FaceDetector`], [`LandmarkModel`]) are written against each model's real,
+//! introspected I/O and compile + load, but the numeric pre/post-processing
+//! (YuNet score/box decode; FaceMesh input normalization and output coordinate
+//! space) is **not yet validated against a real face photo**. Assumptions are
+//! marked `VALIDATE:` inline. Run the ignored `detect_real_face` test with a
+//! photo to confirm/tune them.
 
 use serde::Serialize;
 
@@ -45,22 +37,24 @@ impl Point {
     }
 }
 
-/// dlib 68-point indices for the left eye contour (subject's left), in the
-/// canonical p1..p6 order used by the EAR formula.
-pub const LEFT_EYE_IDX: [usize; 6] = [36, 37, 38, 39, 40, 41];
-/// dlib 68-point indices for the right eye contour, in p1..p6 order.
-pub const RIGHT_EYE_IDX: [usize; 6] = [42, 43, 44, 45, 46, 47];
+// ---------------------------------------------------------------------------
+// Eyes-closed logic (pure, model-agnostic, unit-tested)
+// ---------------------------------------------------------------------------
 
-/// Default EAR below which an eye is considered closed. 0.20–0.25 is the range
-/// used by most references; tune per-camera against your own data.
+/// MediaPipe FaceMesh indices for the left eye (subject's left), in the p1..p6
+/// order the EAR formula expects: [outer corner, top, top, inner corner, bottom,
+/// bottom].
+pub const LEFT_EYE_IDX: [usize; 6] = [33, 160, 158, 133, 153, 144];
+/// MediaPipe FaceMesh indices for the right eye, in p1..p6 order.
+pub const RIGHT_EYE_IDX: [usize; 6] = [362, 385, 387, 263, 373, 380];
+
+/// Default EAR below which an eye is considered closed. 0.20–0.25 is typical for
+/// MediaPipe-derived EAR; tune per-camera against your own data.
 pub const DEFAULT_EAR_THRESHOLD: f32 = 0.22;
 
-/// Eye Aspect Ratio for a single eye given its 6 contour points in p1..p6 order
-/// (p1 = outer corner, p4 = inner corner, p2/p3 top lid, p5/p6 bottom lid).
+/// Eye Aspect Ratio for a single eye given its 6 contour points in p1..p6 order.
 ///
-/// `EAR = (||p2-p6|| + ||p3-p5||) / (2 * ||p1-p4||)`
-///
-/// A wide-open eye yields ~0.3–0.4; a closed eye collapses toward 0.
+/// `EAR = (||p2-p6|| + ||p3-p5||) / (2 * ||p1-p4||)` — ~0.3–0.4 open, →0 closed.
 pub fn eye_aspect_ratio(eye: &[Point; 6]) -> f32 {
     let horizontal = eye[0].dist(eye[3]);
     if horizontal <= f32::EPSILON {
@@ -75,18 +69,24 @@ pub fn eye_aspect_ratio(eye: &[Point; 6]) -> f32 {
 pub struct EyesState {
     pub left_ear: f32,
     pub right_ear: f32,
-    /// True when *both* eyes are at/under the threshold (a "blink" / eyes-closed
-    /// frame you'd typically cull).
+    /// Both eyes at/under threshold (the eyes-closed frame you'd cull).
     pub both_closed: bool,
-    /// True when *either* eye is at/under the threshold.
+    /// Either eye at/under threshold.
     pub any_closed: bool,
 }
 
-/// Classify eyes from a full set of 68 landmarks.
+/// Classify eyes from a full landmark set (MediaPipe mesh ordering).
 pub fn classify_eyes(landmarks: &[Point], threshold: f32) -> Result<EyesState, String> {
-    if landmarks.len() < 48 {
+    let max_idx = LEFT_EYE_IDX
+        .iter()
+        .chain(RIGHT_EYE_IDX.iter())
+        .copied()
+        .max()
+        .unwrap();
+    if landmarks.len() <= max_idx {
         return Err(format!(
-            "expected at least 48 landmarks for 68-point eye indices, got {}",
+            "need at least {} landmarks for eye indices, got {}",
+            max_idx + 1,
             landmarks.len()
         ));
     }
@@ -103,166 +103,322 @@ pub fn classify_eyes(landmarks: &[Point], threshold: f32) -> Result<EyesState, S
     })
 }
 
-/// How a model's output coordinates are expressed.
-#[derive(Debug, Clone, Copy)]
-pub enum OutputSpace {
-    /// Coordinates in [0, 1], relative to the model input crop.
-    Normalized,
-    /// Coordinates in input-pixel units (0..input_width / 0..input_height).
-    InputPixels,
+/// A detected face box in original-image pixel coordinates.
+#[derive(Debug, Clone, Copy, Serialize)]
+pub struct FaceBox {
+    pub x: f32,
+    pub y: f32,
+    pub w: f32,
+    pub h: f32,
+    pub score: f32,
 }
 
-/// Preprocessing / postprocessing contract for a specific landmark model.
-///
-/// Defaults target a common convention (112×112 RGB input, scaled to [0,1],
-/// output normalized to [0,1]); adjust to match your model's card.
-#[derive(Debug, Clone)]
-pub struct ModelConfig {
-    pub input_width: u32,
-    pub input_height: u32,
-    /// Feed channels as BGR instead of RGB.
-    pub bgr: bool,
-    /// Per-channel mean subtracted after scaling (in scaled units).
-    pub mean: [f32; 3],
-    /// Per-channel std divided after mean subtraction.
-    pub std: [f32; 3],
-    /// Multiplier applied to raw 0–255 bytes before mean/std (1/255 → [0,1]).
-    pub scale: f32,
-    /// Coordinate space of the model output.
-    pub output_space: OutputSpace,
-    /// Number of landmark points the model emits (68 for dlib layout).
-    pub num_points: usize,
-}
+impl FaceBox {
+    fn area(&self) -> f32 {
+        self.w * self.h
+    }
 
-impl Default for ModelConfig {
-    fn default() -> Self {
-        Self {
-            input_width: 112,
-            input_height: 112,
-            bgr: false,
-            mean: [0.0, 0.0, 0.0],
-            std: [1.0, 1.0, 1.0],
-            scale: 1.0 / 255.0,
-            output_space: OutputSpace::Normalized,
-            num_points: 68,
+    fn iou(&self, o: &FaceBox) -> f32 {
+        let x1 = self.x.max(o.x);
+        let y1 = self.y.max(o.y);
+        let x2 = (self.x + self.w).min(o.x + o.w);
+        let y2 = (self.y + self.h).min(o.y + o.h);
+        let inter = (x2 - x1).max(0.0) * (y2 - y1).max(0.0);
+        let union = self.area() + o.area() - inter;
+        if union <= 0.0 {
+            0.0
+        } else {
+            inter / union
         }
     }
 }
 
-#[cfg(not(test))]
-mod detector {
+// ---------------------------------------------------------------------------
+// ONNX inference pipeline (YuNet detector + FaceMesh landmarker)
+// ---------------------------------------------------------------------------
+
+mod pipeline {
     use std::path::Path;
 
     use image::{imageops::FilterType, DynamicImage};
+    use ndarray::Array4;
     use ort::session::Session;
     use ort::value::TensorRef;
 
-    use super::{classify_eyes, EyesState, ModelConfig, OutputSpace, Point};
+    use super::{classify_eyes, EyesState, FaceBox, Point};
 
-    /// A landmark detector backed by an `ort` ONNX Runtime session.
-    pub struct LandmarkDetector {
-        session: Session,
-        config: ModelConfig,
+    /// YuNet's fixed square input side.
+    const YUNET_INPUT: u32 = 640;
+    /// YuNet output strides (feature-map downsampling factors).
+    const YUNET_STRIDES: [u32; 3] = [8, 16, 32];
+    /// FaceMesh's fixed square input side.
+    const FACEMESH_INPUT: u32 = 192;
+    /// FaceMesh landmark count (output is this * 3 for x,y,z).
+    const FACEMESH_POINTS: usize = 468;
+
+    fn load_session(path: impl AsRef<Path>) -> Result<Session, String> {
+        Session::builder()
+            .and_then(|mut b| b.commit_from_file(path))
+            .map_err(|e| format!("failed to load ONNX model: {e}"))
     }
 
-    impl LandmarkDetector {
-        /// Load a landmark model from an `.onnx` file.
-        pub fn from_model_path<P: AsRef<Path>>(
-            model_path: P,
-            config: ModelConfig,
-        ) -> Result<Self, String> {
-            let session = Session::builder()
-                .and_then(|mut b| b.commit_from_file(model_path))
-                .map_err(|e| format!("failed to load ONNX model: {e}"))?;
-            Ok(Self { session, config })
+    /// Stage 1: YuNet face detector.
+    pub struct FaceDetector {
+        session: Session,
+        /// Minimum combined score (sqrt(cls*obj)) to keep a detection.
+        pub score_threshold: f32,
+        /// IoU threshold for non-max suppression.
+        pub nms_threshold: f32,
+    }
+
+    impl FaceDetector {
+        pub fn from_model_path(path: impl AsRef<Path>) -> Result<Self, String> {
+            Ok(Self {
+                session: load_session(path)?,
+                score_threshold: 0.6,
+                nms_threshold: 0.3,
+            })
         }
 
-        /// Run the model on an image (assumed to be a cropped/centered face) and
-        /// return landmark points in the *original image's* pixel coordinates.
-        pub fn detect_landmarks(&mut self, img: &DynamicImage) -> Result<Vec<Point>, String> {
+        pub fn detect(&mut self, img: &DynamicImage) -> Result<Vec<FaceBox>, String> {
             let (orig_w, orig_h) = (img.width() as f32, img.height() as f32);
-            let input = self.preprocess(img);
+
+            // Preprocess: resize to 640x640, feed BGR, raw 0-255, NCHW.
+            // VALIDATE: YuNet (libfacedetection) trains on BGR with no
+            // normalization; direct resize (not letterbox) distorts aspect ratio
+            // but keeps faces detectable.
+            let resized = img
+                .resize_exact(YUNET_INPUT, YUNET_INPUT, FilterType::Triangle)
+                .to_rgb8();
+            let mut arr = Array4::<f32>::zeros((1, 3, YUNET_INPUT as usize, YUNET_INPUT as usize));
+            for (x, y, px) in resized.enumerate_pixels() {
+                let [r, g, b] = px.0;
+                arr[[0, 0, y as usize, x as usize]] = b as f32;
+                arr[[0, 1, y as usize, x as usize]] = g as f32;
+                arr[[0, 2, y as usize, x as usize]] = r as f32;
+            }
 
             let outputs = self
                 .session
-                .run(ort::inputs![
-                    TensorRef::from_array_view(&input).map_err(|e| e.to_string())?
-                ])
-                .map_err(|e| format!("inference failed: {e}"))?;
+                .run(ort::inputs![TensorRef::from_array_view(&arr).map_err(|e| e.to_string())?])
+                .map_err(|e| format!("YuNet inference failed: {e}"))?;
 
-            let (_shape, data) = outputs[0]
-                .try_extract_tensor::<f32>()
-                .map_err(|e| format!("failed to read model output: {e}"))?;
+            let (sx, sy) = (orig_w / YUNET_INPUT as f32, orig_h / YUNET_INPUT as f32);
+            let mut boxes = Vec::new();
 
-            let need = self.config.num_points * 2;
-            if data.len() < need {
-                return Err(format!(
-                    "model produced {} values, expected at least {} ({} points × 2)",
-                    data.len(),
-                    need,
-                    self.config.num_points
-                ));
-            }
+            for &stride in &YUNET_STRIDES {
+                let extract = |prefix: &str| -> Result<Vec<f32>, String> {
+                    let name = format!("{prefix}_{stride}");
+                    let (_shape, data) = outputs[name.as_str()]
+                        .try_extract_tensor::<f32>()
+                        .map_err(|e| format!("missing YuNet output {name}: {e}"))?;
+                    Ok(data.to_vec())
+                };
+                let cls = extract("cls")?;
+                let obj = extract("obj")?;
+                let bbox = extract("bbox")?;
 
-            let (sx, sy) = match self.config.output_space {
-                OutputSpace::Normalized => (orig_w, orig_h),
-                OutputSpace::InputPixels => (
-                    orig_w / self.config.input_width as f32,
-                    orig_h / self.config.input_height as f32,
-                ),
-            };
-
-            Ok((0..self.config.num_points)
-                .map(|i| Point {
-                    x: data[2 * i] * sx,
-                    y: data[2 * i + 1] * sy,
-                })
-                .collect())
-        }
-
-        /// Convenience: detect landmarks then classify eyes-open/closed.
-        pub fn analyze_eyes(
-            &mut self,
-            img: &DynamicImage,
-            threshold: f32,
-        ) -> Result<EyesState, String> {
-            let landmarks = self.detect_landmarks(img)?;
-            classify_eyes(&landmarks, threshold)
-        }
-
-        /// Resize + normalize into an NCHW `[1, 3, H, W]` f32 tensor.
-        fn preprocess(&self, img: &DynamicImage) -> ndarray::Array4<f32> {
-            let cfg = &self.config;
-            let resized = img
-                .resize_exact(cfg.input_width, cfg.input_height, FilterType::Triangle)
-                .to_rgb8();
-            let (w, h) = (cfg.input_width as usize, cfg.input_height as usize);
-            let mut arr = ndarray::Array4::<f32>::zeros((1, 3, h, w));
-            for (x, y, px) in resized.enumerate_pixels() {
-                let [r, g, b] = px.0;
-                let channels = if cfg.bgr { [b, g, r] } else { [r, g, b] };
-                for (c, &val) in channels.iter().enumerate() {
-                    let scaled = val as f32 * cfg.scale;
-                    arr[[0, c, y as usize, x as usize]] = (scaled - cfg.mean[c]) / cfg.std[c];
+                let cols = YUNET_INPUT / stride;
+                for i in 0..cls.len() {
+                    // VALIDATE: score = sqrt(cls*obj), matching OpenCV FaceDetectorYN.
+                    let score = (cls[i] * obj[i]).max(0.0).sqrt();
+                    if score < self.score_threshold {
+                        continue;
+                    }
+                    let c = (i as u32 % cols) as f32;
+                    let r = (i as u32 / cols) as f32;
+                    // VALIDATE: prior-cell decode (cx=(col+dx)*stride, w=exp(dw)*stride).
+                    let cx = (c + bbox[i * 4]) * stride as f32;
+                    let cy = (r + bbox[i * 4 + 1]) * stride as f32;
+                    let w = bbox[i * 4 + 2].exp() * stride as f32;
+                    let h = bbox[i * 4 + 3].exp() * stride as f32;
+                    boxes.push(FaceBox {
+                        x: (cx - w / 2.0) * sx,
+                        y: (cy - h / 2.0) * sy,
+                        w: w * sx,
+                        h: h * sy,
+                        score,
+                    });
                 }
             }
-            arr
+
+            Ok(nms(boxes, self.nms_threshold))
         }
+    }
+
+    /// Stage 2: MediaPipe FaceMesh landmark model.
+    pub struct LandmarkModel {
+        session: Session,
+    }
+
+    impl LandmarkModel {
+        pub fn from_model_path(path: impl AsRef<Path>) -> Result<Self, String> {
+            Ok(Self {
+                session: load_session(path)?,
+            })
+        }
+
+        /// Run FaceMesh on a cropped face. Returns landmarks in the model's
+        /// 192x192 input-pixel space (x,y in 0..192) plus the face-presence score.
+        pub fn landmarks(&mut self, crop: &DynamicImage) -> Result<(Vec<Point>, f32), String> {
+            // VALIDATE: FaceMesh expects RGB, NCHW, normalized to [0,1].
+            let resized = crop
+                .resize_exact(FACEMESH_INPUT, FACEMESH_INPUT, FilterType::Triangle)
+                .to_rgb8();
+            let mut arr =
+                Array4::<f32>::zeros((1, 3, FACEMESH_INPUT as usize, FACEMESH_INPUT as usize));
+            for (x, y, px) in resized.enumerate_pixels() {
+                let [r, g, b] = px.0;
+                arr[[0, 0, y as usize, x as usize]] = r as f32 / 255.0;
+                arr[[0, 1, y as usize, x as usize]] = g as f32 / 255.0;
+                arr[[0, 2, y as usize, x as usize]] = b as f32 / 255.0;
+            }
+
+            let outputs = self
+                .session
+                .run(ort::inputs![TensorRef::from_array_view(&arr).map_err(|e| e.to_string())?])
+                .map_err(|e| format!("FaceMesh inference failed: {e}"))?;
+
+            let (_s, lm) = outputs["landmarks"]
+                .try_extract_tensor::<f32>()
+                .map_err(|e| format!("missing FaceMesh 'landmarks' output: {e}"))?;
+            let score = outputs["score"]
+                .try_extract_tensor::<f32>()
+                .ok()
+                .and_then(|(_, s)| s.first().copied())
+                .unwrap_or(1.0);
+
+            let need = FACEMESH_POINTS * 3;
+            if lm.len() < need {
+                return Err(format!(
+                    "FaceMesh returned {} values, expected {} ({} pts x 3)",
+                    lm.len(),
+                    need,
+                    FACEMESH_POINTS
+                ));
+            }
+            // VALIDATE: FaceMesh outputs landmarks in input-pixel space (0..192).
+            let pts = (0..FACEMESH_POINTS)
+                .map(|i| Point {
+                    x: lm[i * 3],
+                    y: lm[i * 3 + 1],
+                })
+                .collect();
+            Ok((pts, score))
+        }
+    }
+
+    /// Both stages combined: detect the primary face, crop it, run landmarks,
+    /// classify eyes.
+    pub struct FacePipeline {
+        detector: FaceDetector,
+        landmarker: LandmarkModel,
+    }
+
+    impl FacePipeline {
+        pub fn new(
+            detector_model: impl AsRef<Path>,
+            landmarker_model: impl AsRef<Path>,
+        ) -> Result<Self, String> {
+            Ok(Self {
+                detector: FaceDetector::from_model_path(detector_model)?,
+                landmarker: LandmarkModel::from_model_path(landmarker_model)?,
+            })
+        }
+
+        /// Detect the largest face, run landmarks on it, and classify eyes.
+        /// Returns `Ok(None)` when no face passes the detector.
+        pub fn analyze_primary_face(
+            &mut self,
+            img: &DynamicImage,
+            ear_threshold: f32,
+        ) -> Result<Option<EyesState>, String> {
+            let faces = self.detector.detect(img)?;
+            let Some(face) = faces
+                .into_iter()
+                .max_by(|a, b| a.area().partial_cmp(&b.area()).unwrap_or(std::cmp::Ordering::Equal))
+            else {
+                return Ok(None);
+            };
+
+            let (crop, rect) = crop_face(img, &face, 0.25);
+            let (lm192, _score) = self.landmarker.landmarks(&crop)?;
+
+            // Map 192-space landmarks back to original-image coordinates.
+            let (x0, y0, cw, ch) = rect;
+            let landmarks: Vec<Point> = lm192
+                .iter()
+                .map(|p| Point {
+                    x: x0 + p.x / FACEMESH_INPUT as f32 * cw,
+                    y: y0 + p.y / FACEMESH_INPUT as f32 * ch,
+                })
+                .collect();
+
+            Ok(Some(classify_eyes(&landmarks, ear_threshold)?))
+        }
+    }
+
+    /// Crop a square region around a face box (with margin), clamped to the
+    /// image. Returns the crop and its `(x0, y0, w, h)` rect in original pixels.
+    fn crop_face(
+        img: &DynamicImage,
+        face: &FaceBox,
+        margin: f32,
+    ) -> (DynamicImage, (f32, f32, f32, f32)) {
+        let cx = face.x + face.w / 2.0;
+        let cy = face.y + face.h / 2.0;
+        let side = face.w.max(face.h) * (1.0 + 2.0 * margin);
+        let (iw, ih) = (img.width() as f32, img.height() as f32);
+        let x0 = (cx - side / 2.0).clamp(0.0, iw - 1.0);
+        let y0 = (cy - side / 2.0).clamp(0.0, ih - 1.0);
+        let w = (x0 + side).min(iw) - x0;
+        let h = (y0 + side).min(ih) - y0;
+        let crop = img.crop_imm(x0 as u32, y0 as u32, w.max(1.0) as u32, h.max(1.0) as u32);
+        (crop, (x0, y0, w.max(1.0), h.max(1.0)))
+    }
+
+    /// Greedy non-max suppression by descending score.
+    fn nms(mut boxes: Vec<FaceBox>, iou_threshold: f32) -> Vec<FaceBox> {
+        boxes.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        let mut kept: Vec<FaceBox> = Vec::new();
+        'candidate: for b in boxes {
+            for k in &kept {
+                if b.iou(k) > iou_threshold {
+                    continue 'candidate;
+                }
+            }
+            kept.push(b);
+        }
+        kept
     }
 }
 
-#[cfg(not(test))]
-pub use detector::LandmarkDetector;
+pub use pipeline::{FaceDetector, FacePipeline, LandmarkModel};
+
+/// Tauri command: detect the primary face in an image and classify eyes-closed.
+/// Loads both ONNX models per call. Returns `None` if no face is found.
+#[tauri::command]
+pub fn analyze_face_eyes(
+    image_path: String,
+    detector_model: String,
+    landmarker_model: String,
+    ear_threshold: Option<f32>,
+) -> Result<Option<EyesState>, String> {
+    let img = image::open(&image_path).map_err(|e| format!("open {image_path}: {e}"))?;
+    let mut pipe = FacePipeline::new(&detector_model, &landmarker_model)?;
+    pipe.analyze_primary_face(&img, ear_threshold.unwrap_or(DEFAULT_EAR_THRESHOLD))
+}
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use image::imageops::FilterType;
 
-    /// Build a 68-point set where every point is at the origin except the two
-    /// eyes, which we set explicitly. Enough to exercise `classify_eyes`.
     fn landmarks_with_eyes(left: [Point; 6], right: [Point; 6]) -> Vec<Point> {
-        let mut pts = vec![Point { x: 0.0, y: 0.0 }; 68];
+        let mut pts = vec![Point { x: 0.0, y: 0.0 }; 468];
         for (slot, &p) in LEFT_EYE_IDX.iter().zip(left.iter()) {
             pts[*slot] = p;
         }
@@ -272,19 +428,17 @@ mod tests {
         pts
     }
 
-    /// A synthetic open eye: 40px wide, ~16px tall lid separation -> EAR ~0.4.
     fn open_eye(cx: f32, cy: f32) -> [Point; 6] {
         [
-            Point { x: cx - 20.0, y: cy },        // p1 outer corner
-            Point { x: cx - 7.0, y: cy - 8.0 },   // p2 top
-            Point { x: cx + 7.0, y: cy - 8.0 },   // p3 top
-            Point { x: cx + 20.0, y: cy },        // p4 inner corner
-            Point { x: cx + 7.0, y: cy + 8.0 },   // p5 bottom
-            Point { x: cx - 7.0, y: cy + 8.0 },   // p6 bottom
+            Point { x: cx - 20.0, y: cy },
+            Point { x: cx - 7.0, y: cy - 8.0 },
+            Point { x: cx + 7.0, y: cy - 8.0 },
+            Point { x: cx + 20.0, y: cy },
+            Point { x: cx + 7.0, y: cy + 8.0 },
+            Point { x: cx - 7.0, y: cy + 8.0 },
         ]
     }
 
-    /// A synthetic closed eye: same width, lids nearly touching -> EAR ~0.02.
     fn closed_eye(cx: f32, cy: f32) -> [Point; 6] {
         [
             Point { x: cx - 20.0, y: cy },
@@ -301,37 +455,31 @@ mod tests {
         let open = eye_aspect_ratio(&open_eye(100.0, 100.0));
         let closed = eye_aspect_ratio(&closed_eye(100.0, 100.0));
         println!("EAR open={open:.3} closed={closed:.3}");
-        assert!(open > 0.35, "open eye EAR should be high, got {open:.3}");
-        assert!(closed < 0.1, "closed eye EAR should be near zero, got {closed:.3}");
-        assert!(open > closed * 5.0);
+        assert!(open > 0.35 && closed < 0.1 && open > closed * 5.0);
     }
 
     #[test]
     fn ear_degenerate_eye_is_zero() {
-        let zero = eye_aspect_ratio(&[Point { x: 0.0, y: 0.0 }; 6]);
-        assert_eq!(zero, 0.0);
+        assert_eq!(eye_aspect_ratio(&[Point { x: 0.0, y: 0.0 }; 6]), 0.0);
     }
 
     #[test]
     fn classify_both_open() {
         let lm = landmarks_with_eyes(open_eye(80.0, 100.0), open_eye(160.0, 100.0));
-        let s = classify_eyes(&lm, DEFAULT_EAR_THRESHOLD).unwrap();
-        assert!(!s.any_closed, "both eyes open -> not closed: {s:?}");
+        assert!(!classify_eyes(&lm, DEFAULT_EAR_THRESHOLD).unwrap().any_closed);
     }
 
     #[test]
     fn classify_both_closed() {
         let lm = landmarks_with_eyes(closed_eye(80.0, 100.0), closed_eye(160.0, 100.0));
-        let s = classify_eyes(&lm, DEFAULT_EAR_THRESHOLD).unwrap();
-        assert!(s.both_closed, "both eyes closed -> both_closed: {s:?}");
-        assert!(s.any_closed);
+        assert!(classify_eyes(&lm, DEFAULT_EAR_THRESHOLD).unwrap().both_closed);
     }
 
     #[test]
     fn classify_one_closed_is_any_not_both() {
         let lm = landmarks_with_eyes(open_eye(80.0, 100.0), closed_eye(160.0, 100.0));
         let s = classify_eyes(&lm, DEFAULT_EAR_THRESHOLD).unwrap();
-        assert!(s.any_closed && !s.both_closed, "one closed -> any but not both: {s:?}");
+        assert!(s.any_closed && !s.both_closed);
     }
 
     #[test]
@@ -339,73 +487,39 @@ mod tests {
         assert!(classify_eyes(&[Point { x: 0.0, y: 0.0 }; 10], DEFAULT_EAR_THRESHOLD).is_err());
     }
 
-    /// Confirms the ONNX Runtime dylib (onnxruntime.dll) loads via the
-    /// ORT_DYLIB_PATH wired up in `.cargo/config.toml`. This does NOT run
-    /// inference — it forces `ort` to dlopen the runtime and read its version
-    /// string, proving the dynamic-loading setup works end-to-end. If the DLL
-    /// is missing or the wrong version, `ort::info()` panics with the reason.
+    /// Confirms onnxruntime.dll loads via ORT_DYLIB_PATH (.cargo/config.toml).
+    /// Forces `ort` to dlopen the runtime and read its version — no inference.
     #[test]
     fn onnxruntime_dylib_loads() {
         let dylib = std::env::var("ORT_DYLIB_PATH").unwrap_or_else(|_| "<unset>".into());
         println!("ORT_DYLIB_PATH = {dylib}");
         let info = ort::info();
         println!("ONNX Runtime build info: {info}");
-        assert!(
-            info.contains("ORT") || !info.is_empty(),
-            "ort::info() returned nothing; the dylib did not load"
-        );
+        assert!(!info.is_empty());
     }
 
-    /// End-to-end ONNX inference against a real model + face image. Ignored by
-    /// default (no model/photo in the test set yet). To enable:
+    /// Full pipeline against real models + a face photo. Ignored by default
+    /// (no test photo yet). Both models are already in `models/`; supply a photo:
     ///
-    ///   $env:CULLING_TEST_FACE_MODEL = "C:\path\to\landmarks_68.onnx"
     ///   $env:CULLING_TEST_FACE_IMAGE = "C:\path\to\face.jpg"
     ///   cargo test -p tauri-app detect_real_face -- --ignored --nocapture
-    ///
-    /// Note: this test builds its own session so it can run under `cfg(test)`,
-    /// where the production `LandmarkDetector` is compiled out to keep the pure
-    /// EAR logic testable without linking against a model.
     #[test]
-    #[ignore = "requires an ONNX landmark model + face image"]
+    #[ignore = "requires a face photo; set CULLING_TEST_FACE_IMAGE"]
     fn detect_real_face() {
-        let model = std::env::var("CULLING_TEST_FACE_MODEL")
-            .expect("set CULLING_TEST_FACE_MODEL");
-        let image = std::env::var("CULLING_TEST_FACE_IMAGE")
-            .expect("set CULLING_TEST_FACE_IMAGE");
+        let image = std::env::var("CULLING_TEST_FACE_IMAGE").expect("set CULLING_TEST_FACE_IMAGE");
+        let detector = std::env::var("CULLING_TEST_DETECTOR")
+            .unwrap_or_else(|_| "../models/face_detection_yunet_2023mar.onnx".into());
+        let landmarker = std::env::var("CULLING_TEST_LANDMARKER")
+            .unwrap_or_else(|_| "../models/face_landmarker.onnx".into());
 
-        let cfg = ModelConfig::default();
         let img = image::open(&image).expect("open face image");
-        let resized = img
-            .resize_exact(cfg.input_width, cfg.input_height, FilterType::Triangle)
-            .to_rgb8();
-        let (w, h) = (cfg.input_width as usize, cfg.input_height as usize);
-        let mut arr = ndarray::Array4::<f32>::zeros((1, 3, h, w));
-        for (x, y, px) in resized.enumerate_pixels() {
-            let [r, g, b] = px.0;
-            for (c, &val) in [r, g, b].iter().enumerate() {
-                arr[[0, c, y as usize, x as usize]] = (val as f32 * cfg.scale - cfg.mean[c]) / cfg.std[c];
-            }
+        let mut pipe = FacePipeline::new(&detector, &landmarker).expect("load pipeline");
+        match pipe
+            .analyze_primary_face(&img, DEFAULT_EAR_THRESHOLD)
+            .expect("analyze")
+        {
+            Some(state) => println!("eyes: {state:?}"),
+            None => println!("no face detected"),
         }
-
-        let mut session = ort::session::Session::builder()
-            .and_then(|mut b| b.commit_from_file(&model))
-            .expect("load model");
-        let outputs = session
-            .run(ort::inputs![
-                ort::value::TensorRef::from_array_view(&arr).unwrap()
-            ])
-            .expect("inference");
-        let (shape, data) = outputs[0].try_extract_tensor::<f32>().expect("extract");
-        println!("output shape {shape:?}, {} values", data.len());
-
-        let pts: Vec<Point> = (0..cfg.num_points)
-            .map(|i| Point {
-                x: data[2 * i] * img.width() as f32,
-                y: data[2 * i + 1] * img.height() as f32,
-            })
-            .collect();
-        let state = classify_eyes(&pts, DEFAULT_EAR_THRESHOLD).expect("classify");
-        println!("eyes: {state:?}");
     }
 }

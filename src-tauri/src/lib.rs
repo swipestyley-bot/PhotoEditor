@@ -11,7 +11,11 @@ fn greet(name: &str) -> String {
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
-        .invoke_handler(tauri::generate_handler![greet, vision::analyze_image])
+        .invoke_handler(tauri::generate_handler![
+            greet,
+            vision::analyze_image,
+            face::analyze_face_eyes
+        ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }

@@ -21,20 +21,23 @@ is fetched separately — see [`scripts/fetch-onnxruntime.ps1`](../scripts/fetch
 
 ## Where models go
 
-Place downloaded `.onnx` files in the git-ignored `models/` directory at the
-project root:
+**One-command setup:** `pwsh scripts/fetch-models.ps1` downloads both models
+into `models/`. (`pwsh scripts/fetch-onnxruntime.ps1` fetches the runtime DLL.)
+
+Both land in the git-ignored `models/` directory at the project root:
 
 ```
 tauri-app/
   models/
-    face_detection_yunet_2023mar.onnx     # detector (Stage 1)
-    face_landmarker.onnx                   # landmarks (Stage 2)  ← see notes
+    face_detection_yunet_2023mar.onnx     # detector (Stage 1) — YuNet, MIT
+    face_landmarker.onnx                   # landmarks (Stage 2) — FaceMesh, Apache-2.0
   runtime/
     onnxruntime.dll                        # fetched by scripts/fetch-onnxruntime.ps1
 ```
 
 `models/` and `runtime/` are in `.gitignore` (large binaries are fetched, not
-committed).
+committed). The Stage-by-stage sections below document each model's source and
+license; the manual download commands are kept for reference.
 
 ---
 
@@ -78,26 +81,29 @@ the recommended landmark model is **MediaPipe Face Landmarker**:
 - Model card / license:
   [Face landmark detection guide](https://developers.google.com/edge/mediapipe/solutions/vision/face_landmarker)
 
-**ONNX caveat.** MediaPipe ships `.task`/`.tflite`, not ONNX. Two options:
-1. **Pre-converted ONNX** — community conversions exist (e.g. the PINTO model
-   zoo hosts MediaPipe face-mesh in ONNX). The *weights* remain Google's
-   Apache-2.0; verify the specific repo's terms before use.
-2. **Convert yourself** — extract the `.tflite` from the `.task` bundle and run
-   `tf2onnx` (`python -m tf2onnx.convert --tflite face_landmark.tflite
-   --output face_landmarker.onnx`).
+**ONNX build (already wired up).** MediaPipe ships `.task`/`.tflite`, not ONNX,
+so this project uses a pre-converted ONNX build of Google's FaceMesh from the
+**[PINTO model zoo](https://github.com/PINTO0309/PINTO_model_zoo) (repo: MIT;
+weights: Google Apache-2.0)**. `scripts/fetch-models.ps1` downloads it and
+installs it as `models/face_landmarker.onnx`. Its introspected I/O:
 
-### Adapting the code to MediaPipe indices
+- **Input** `input`: `[1, 3, 192, 192]` f32 (NCHW, RGB, normalized to `[0,1]`)
+- **Output** `landmarks`: `[1, 1, 1, 1404]` = **468 landmarks × (x, y, z)** in
+  192×192 input-pixel space
+- **Output** `score`: `[1, 1, 1, 1]` face-presence logit
 
-`src/face.rs` currently computes EAR using **dlib 68-point** eye indices
-(`LEFT_EYE_IDX` = 36–41, `RIGHT_EYE_IDX` = 42–47) as a reference implementation.
-MediaPipe's mesh uses different indices — the common EAR point sets are:
+If you prefer, the official `.task` bundle can be converted yourself
+(`tf2onnx` on the extracted `.tflite`) — the weights are the same Apache-2.0.
 
-- Left eye:  `33, 160, 158, 133, 153, 144`
-- Right eye: `362, 385, 387, 263, 373, 380`
+### Eye indices (implemented in `src/face.rs`)
 
-Swap those into `LEFT_EYE_IDX` / `RIGHT_EYE_IDX` (and set
-`ModelConfig::num_points = 478`) when you wire up MediaPipe — or skip EAR
-entirely and read the `eyeBlink*` blendshapes if you use the blendshape output.
+`src/face.rs` computes EAR from the MediaPipe mesh eye indices:
+
+- Left eye:  `LEFT_EYE_IDX  = [33, 160, 158, 133, 153, 144]`
+- Right eye: `RIGHT_EYE_IDX = [362, 385, 387, 263, 373, 380]`
+
+Alternatively, skip EAR and read `eyeBlinkLeft`/`eyeBlinkRight` from the
+blendshape model if you later switch to the blendshape output.
 
 ---
 
@@ -123,6 +129,7 @@ landmark model on a commercially-licensed dataset.
 | ONNX Runtime (`onnxruntime.dll`) | MIT | ✅ | Microsoft |
 | `ort` crate | MIT/Apache-2.0 | ✅ | crates.io |
 | YuNet detector | MIT | ✅ | OpenCV Zoo `LICENSE` |
-| MediaPipe Face Landmarker | Apache-2.0 | ✅ | Google model card |
+| MediaPipe FaceMesh (weights) | Apache-2.0 | ✅ | Google model card |
+| PINTO model zoo (ONNX conversion) | MIT | ✅ | repo `LICENSE` |
 | dlib 68-point | 300-W non-commercial | ❌ | — |
 | InsightFace pretrained | non-commercial | ❌ | — |
