@@ -94,6 +94,10 @@ interface Preset {
   params: EditParams;
 }
 
+interface HealStamp { x: number; y: number; r: number; }
+interface HealStroke { stamps: HealStamp[]; }
+interface RetouchOps { heals: HealStroke[]; }
+
 type CropRect = { x: number; y: number; w: number; h: number };
 const ASPECTS = ["Free", "1:1", "4:5", "16:9", "Original"] as const;
 type Aspect = (typeof ASPECTS)[number];
@@ -137,6 +141,7 @@ const ADJUST_GROUPS: { title: string; icon: string; sliders: SliderCfg[] }[] = [
   { title: "Geometry", icon: "▢", sliders: [
     { key: "straighten", label: "Straighten", min: -100, max: 100 },
   ] },
+  { title: "Retouch", icon: "✚", sliders: [] },
 ];
 
 type Decision = "keep" | "reject";
@@ -197,6 +202,9 @@ export default function App() {
   const [wmPos, setWmPos] = useState("bottomRight");
   const [wmOpacity, setWmOpacity] = useState(60);
   const [wmSize, setWmSize] = useState(40);
+  const [retouch, setRetouch] = useState<Record<string, RetouchOps>>({});
+  const [retouchMode, setRetouchMode] = useState(false);
+  const [brushSize, setBrushSize] = useState(40);
 
   async function runAnalysis(command: string, args: Record<string, unknown>) {
     setLoading(true);
@@ -211,6 +219,8 @@ export default function App() {
     setComparing(false);
     setCropMode(false);
     setCropAspect("Free");
+    setRetouch({});
+    setRetouchMode(false);
     setMode("cull");
     setProject(null);
     try {
@@ -369,23 +379,52 @@ export default function App() {
     if (cropMode) { setCropMode(false); return; }
     const p = settings[editPhoto.path] ?? DEFAULT_EDIT;
     if (!(p.cropW > 0)) updateCrop(editPhoto.path, { x: 0, y: 0, w: 1, h: 1 });
+    setRetouchMode(false);
     setCropMode(true);
   }
   function resetCrop() {
     if (editPhoto) updateCrop(editPhoto.path, { x: 0, y: 0, w: 0, h: 0 });
   }
 
+  function retouchFor(path: string): RetouchOps {
+    return retouch[path] ?? { heals: [] };
+  }
+  function addHealStroke(path: string, stamps: HealStamp[]) {
+    if (!stamps.length) return;
+    setRetouch((prev) => {
+      const cur = prev[path] ?? { heals: [] };
+      return { ...prev, [path]: { heals: [...cur.heals, { stamps }] } };
+    });
+  }
+  function undoHeal(path: string) {
+    setRetouch((prev) => {
+      const cur = prev[path] ?? { heals: [] };
+      return { ...prev, [path]: { heals: cur.heals.slice(0, -1) } };
+    });
+  }
+  function clearHeal(path: string) {
+    setRetouch((prev) => ({ ...prev, [path]: { heals: [] } }));
+  }
+  function toggleRetouch() {
+    if (!editPhoto) return;
+    if (retouchMode) { setRetouchMode(false); return; }
+    setCropMode(false);
+    setRetouchMode(true);
+  }
+
   // Live edit preview (shared by the stage + histogram), debounced for real-time.
   const editParamsKey = editPhoto ? JSON.stringify(paramsFor(editPhoto.path)) : "";
+  const retouchKey = editPhoto ? JSON.stringify(retouchFor(editPhoto.path)) : "";
   useEffect(() => {
     if (mode !== "edit" || !editPhoto || editPhoto.error) { setEditPreview(null); return; }
     const path = editPhoto.path;
     const params = paramsFor(path);
+    const rt = retouchFor(path);
     let cancelled = false;
     setEditRendering(true);
     const t = setTimeout(async () => {
       try {
-        const pv = await invoke<{ before: string; after: string }>("preview_edit", { path, params, cropPreview: cropMode });
+        const pv = await invoke<{ before: string; after: string }>("preview_edit", { path, params, retouch: rt, cropPreview: cropMode || retouchMode });
         if (!cancelled) setEditPreview(pv);
       } catch {
         if (!cancelled) setEditPreview(null);
@@ -395,7 +434,7 @@ export default function App() {
     }, 60);
     return () => { cancelled = true; clearTimeout(t); };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [mode, editPhoto?.path, editParamsKey, cropMode]);
+  }, [mode, editPhoto?.path, editParamsKey, retouchKey, cropMode, retouchMode]);
 
   // load saved presets once
   useEffect(() => {
@@ -437,7 +476,7 @@ export default function App() {
     setStatus(null);
     setExportOpen(false);
     try {
-      const items = selects.map((p) => ({ path: p.path, params: paramsFor(p.path) }));
+      const items = selects.map((p) => ({ path: p.path, params: paramsFor(p.path), retouch: retouchFor(p.path) }));
       const naming = renameOn && renamePrefix.trim() ? { prefix: renamePrefix.trim(), start: renameStart } : null;
       let watermark: unknown = null;
       if (wmKind === "text" && wmText.trim()) {
@@ -506,6 +545,14 @@ export default function App() {
                 onCropChange={(r) => updateCrop(editPhoto.path, r)}
                 onResetCrop={resetCrop}
                 onExitCrop={() => setCropMode(false)}
+                retouchMode={retouchMode}
+                brushSize={brushSize}
+                onBrushSize={setBrushSize}
+                onHealStroke={(stamps) => addHealStroke(editPhoto.path, stamps)}
+                onUndoHeal={() => undoHeal(editPhoto.path)}
+                onClearHeal={() => clearHeal(editPhoto.path)}
+                hasHeals={retouchFor(editPhoto.path).heals.length > 0}
+                onExitRetouch={() => setRetouchMode(false)}
               />
             ) : (
               <div className="placeholder"><div className="big">🎞️</div>No selects to edit.</div>
@@ -525,6 +572,8 @@ export default function App() {
                 onReset={() => resetPhoto(editPhoto.path)}
                 cropMode={cropMode}
                 onToggleCrop={toggleCrop}
+                retouchMode={retouchMode}
+                onToggleRetouch={toggleRetouch}
               />
             ) : (
               <div className="panel-empty">No selects</div>
@@ -812,12 +861,14 @@ function PhotoPanel({ photo, decision, onKeep, onReject }: {
 }
 
 // ---- right inspector (edit): full adjustment panel ----
-function AdjustPanel({ params, onChange, onReset, cropMode, onToggleCrop }: {
+function AdjustPanel({ params, onChange, onReset, cropMode, onToggleCrop, retouchMode, onToggleRetouch }: {
   params: EditParams;
   onChange: (key: keyof EditParams, value: number) => void;
   onReset: () => void;
   cropMode: boolean;
   onToggleCrop: () => void;
+  retouchMode: boolean;
+  onToggleRetouch: () => void;
 }) {
   const [collapsed, setCollapsed] = useState<Set<string>>(new Set());
   const toggle = (t: string) =>
@@ -848,6 +899,16 @@ function AdjustPanel({ params, onChange, onReset, cropMode, onToggleCrop }: {
                   <button className={"crop-toggle" + (cropMode ? " active" : "")} onClick={onToggleCrop}>
                     ▢ {cropMode ? "Exit crop" : "Crop"}
                   </button>
+                )}
+                {g.title === "Retouch" && (
+                  <>
+                    <button className={"crop-toggle" + (retouchMode ? " active" : "")} onClick={onToggleRetouch}>
+                      ✚ {retouchMode ? "Exit healing" : "Healing brush"}
+                    </button>
+                    <p className="panel-note" style={{ margin: "8px 0 0" }}>
+                      Paint over blemishes/spots — filled from nearby texture. Per-photo (not synced or saved in presets).
+                    </p>
+                  </>
                 )}
                 {g.sliders.map((s) => (
                   <SliderRow
@@ -1018,15 +1079,45 @@ function NamePrompt({ title, placeholder, onConfirm, onCancel }: {
 }
 
 // ---- edit center stage: edited photo, hold to compare, crop mode ----
-function EditStage({ photo, params, preview, rendering, comparing, onCompare, cropMode, cropAspect, onAspect, onCropChange, onResetCrop, onExitCrop }: {
+function EditStage({ photo, params, preview, rendering, comparing, onCompare, cropMode, cropAspect, onAspect, onCropChange, onResetCrop, onExitCrop, retouchMode, brushSize, onBrushSize, onHealStroke, onUndoHeal, onClearHeal, hasHeals, onExitRetouch }: {
   photo: Photo; params: EditParams;
   preview: { before: string; after: string } | null; rendering: boolean;
   comparing: boolean; onCompare: (v: boolean) => void;
   cropMode: boolean; cropAspect: Aspect; onAspect: (a: Aspect) => void;
   onCropChange: (r: CropRect) => void; onResetCrop: () => void; onExitCrop: () => void;
+  retouchMode: boolean; brushSize: number; onBrushSize: (v: number) => void;
+  onHealStroke: (stamps: HealStamp[]) => void; onUndoHeal: () => void; onClearHeal: () => void;
+  hasHeals: boolean; onExitRetouch: () => void;
 }) {
   const [nat, setNat] = useState<{ w: number; h: number } | null>(null);
   const src = preview ? (comparing ? preview.before : preview.after) : photo.thumbnail;
+
+  if (retouchMode) {
+    const brushR = 0.01 + (brushSize / 100) * 0.08; // normalized radius (~1%..9% of width)
+    return (
+      <div className="stage">
+        <div className="crop-area">
+          {src ? (
+            <div className="crop-frame">
+              <img className="crop-img" src={src} alt={photo.name} />
+              <RetouchOverlay brushR={brushR} onStroke={onHealStroke} />
+            </div>
+          ) : (
+            <div className="loupe-loading">Loading…</div>
+          )}
+          {rendering && <div className="rendering">Healing…</div>}
+        </div>
+        <div className="crop-toolbar">
+          <span className="ex-mini">Brush</span>
+          <input className="brush-slider" type="range" min={0} max={100} value={brushSize} onChange={(e) => onBrushSize(+e.target.value)} />
+          <div className="spacer" />
+          <button className="ghost sm" onClick={onUndoHeal} disabled={!hasHeals}>Undo</button>
+          <button className="ghost sm" onClick={onClearHeal} disabled={!hasHeals}>Clear</button>
+          <button className="confirm sm" onClick={onExitRetouch}>Done</button>
+        </div>
+      </div>
+    );
+  }
 
   if (cropMode) {
     const dims = nat ?? { w: photo.width || 3, h: photo.height || 4 };
@@ -1197,6 +1288,58 @@ function CropOverlay({ rect, na, onChange }: { rect: CropRect; na: number | null
           <div key={h} className={"crop-handle h-" + h} onPointerDown={(e) => start(h, e)} />
         ))}
       </div>
+    </div>
+  );
+}
+
+// ---- healing brush overlay ----
+function RetouchOverlay({ brushR, onStroke }: { brushR: number; onStroke: (stamps: HealStamp[]) => void }) {
+  const ref = useRef<HTMLDivElement>(null);
+  const [cursor, setCursor] = useState<{ x: number; y: number } | null>(null);
+  const [painting, setPainting] = useState<HealStamp[]>([]);
+
+  const norm = (cx: number, cy: number, box: DOMRect) => ({ x: (cx - box.left) / box.width, y: (cy - box.top) / box.height });
+
+  function down(e: ReactPointerEvent) {
+    e.preventDefault();
+    const box = ref.current?.getBoundingClientRect();
+    if (!box) return;
+    const stamps: HealStamp[] = [];
+    let last: { x: number; y: number } | null = null;
+    const add = (cx: number, cy: number) => {
+      const p = norm(cx, cy, box);
+      if (!last || Math.hypot(p.x - last.x, p.y - last.y) >= brushR * 0.6) {
+        stamps.push({ x: p.x, y: p.y, r: brushR });
+        last = p;
+        setPainting([...stamps]);
+      }
+    };
+    add(e.clientX, e.clientY);
+    const move = (ev: PointerEvent) => { add(ev.clientX, ev.clientY); setCursor(norm(ev.clientX, ev.clientY, box)); };
+    const up = () => {
+      window.removeEventListener("pointermove", move);
+      window.removeEventListener("pointerup", up);
+      if (stamps.length) onStroke(stamps);
+      setPainting([]);
+    };
+    window.addEventListener("pointermove", move);
+    window.addEventListener("pointerup", up);
+  }
+
+  const circle = (x: number, y: number, cls: string, key?: number) => (
+    <div key={key} className={cls} style={{ left: `${x * 100}%`, top: `${y * 100}%`, width: `${brushR * 200}%` }} />
+  );
+
+  return (
+    <div
+      className="retouch-overlay"
+      ref={ref}
+      onPointerDown={down}
+      onPointerMove={(e) => { const box = ref.current?.getBoundingClientRect(); if (box) setCursor(norm(e.clientX, e.clientY, box)); }}
+      onPointerLeave={() => setCursor(null)}
+    >
+      {painting.map((s, i) => circle(s.x, s.y, "heal-mark", i))}
+      {cursor && circle(cursor.x, cursor.y, "brush-cursor")}
     </div>
   );
 }

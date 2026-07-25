@@ -410,6 +410,8 @@ pub struct ExportResult {
 pub struct ExportItem {
     pub path: String,
     pub params: crate::edit::EditParams,
+    #[serde(default)]
+    pub retouch: crate::edit::RetouchOps,
 }
 
 /// Batch-rename pattern: output files become `{prefix}_{NNN}` from `start`.
@@ -456,7 +458,7 @@ pub fn export_selects(
             errors.push(format!("skipped (no file name): {}", item.path));
             continue;
         };
-        let edit = corrected && !item.params.is_noop();
+        let edit = corrected && (!item.params.is_noop() || !item.retouch.is_empty());
         let render = edit || watermark.is_some();
         let ext = if render {
             "jpg".to_string()
@@ -472,7 +474,7 @@ pub fn export_selects(
 
         let result = if render {
             decode_image(src).and_then(|img| {
-                let img = if edit { crate::edit::auto_edit(&img, item.params) } else { img };
+                let img = if edit { crate::edit::render_full(&img, item.params, &item.retouch) } else { img };
                 let img = match &watermark {
                     Some(wm) => apply_watermark(img, wm)?,
                     None => img,
@@ -654,6 +656,7 @@ fn preview_cache() -> &'static Mutex<HashMap<String, Arc<DynamicImage>>> {
 pub fn preview_edit(
     path: String,
     params: crate::edit::EditParams,
+    retouch: crate::edit::RetouchOps,
     crop_preview: bool,
 ) -> Result<PreviewPair, String> {
     let img = {
@@ -668,10 +671,11 @@ pub fn preview_edit(
     };
     let straightened = crate::edit::straighten(&img, params);
     let colored = crate::edit::color(&straightened, params);
+    let retouched = crate::edit::apply_retouch(&colored, &retouch);
     let (before_img, after_img) = if crop_preview {
-        (straightened, colored)
+        (straightened, retouched)
     } else {
-        (crate::edit::crop(&straightened, params), crate::edit::crop(&colored, params))
+        (crate::edit::crop(&straightened, params), crate::edit::crop(&retouched, params))
     };
     Ok(PreviewPair {
         before: encode_jpeg_data_uri(&before_img)?,

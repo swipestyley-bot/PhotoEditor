@@ -184,7 +184,7 @@ fn main() {
     fs::create_dir_all(&ed_dir).unwrap();
     fs::create_dir_all(&wm_dir).unwrap();
     let mk = |prm: EditParams, n: usize| -> Vec<ExportItem> {
-        paths.iter().take(n).map(|p| ExportItem { path: p.to_string_lossy().to_string(), params: prm }).collect()
+        paths.iter().take(n).map(|p| ExportItem { path: p.to_string_lossy().to_string(), params: prm, retouch: Default::default() }).collect()
     };
     // Edited + batch rename (TestShoot_001, _002, ...)
     let e = export_selects(

@@ -484,6 +484,170 @@ fn split_tone_buf(buf: &mut [f32], sh_hue: f32, sh_sat: f32, hi_hue: f32, hi_sat
     }
 }
 
+// --- retouch: healing / spot removal ---------------------------------------
+
+/// A circular healing stamp, normalized: `x`,`y` in 0..1, `r` as a fraction of
+/// image width.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct HealStamp {
+    pub x: f32,
+    pub y: f32,
+    pub r: f32,
+}
+
+/// One healing brush stroke (a click is a single-stamp stroke).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HealStroke {
+    pub stamps: Vec<HealStamp>,
+}
+
+/// Per-photo spatial retouch operations, kept separate from the scalar
+/// `EditParams` (which stays simple/Copy). Liquify will join here later.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RetouchOps {
+    #[serde(default)]
+    pub heals: Vec<HealStroke>,
+}
+
+impl RetouchOps {
+    pub fn is_empty(&self) -> bool {
+        self.heals.iter().all(|s| s.stamps.is_empty())
+    }
+}
+
+const POISSON_ITERS: usize = 180;
+
+/// Apply every healing stamp to a copy of the image, in order.
+pub fn apply_retouch(img: &DynamicImage, retouch: &RetouchOps) -> DynamicImage {
+    if retouch.is_empty() {
+        return img.clone();
+    }
+    let mut rgb = img.to_rgb8();
+    let (w, h) = rgb.dimensions();
+    for stroke in &retouch.heals {
+        for s in &stroke.stamps {
+            let r = (s.r * w as f32).round().clamp(2.0, (w.min(h) as f32) / 3.0) as i32;
+            let cx = (s.x * w as f32).round() as i32;
+            let cy = (s.y * h as f32).round() as i32;
+            heal_spot(&mut rgb, cx, cy, r);
+        }
+    }
+    DynamicImage::ImageRgb8(rgb)
+}
+
+/// Heal one circular spot: find the best-matching nearby source patch, then
+/// Poisson (gradient-domain) seamless-clone it over the spot.
+fn heal_spot(img: &mut RgbImage, cx: i32, cy: i32, r: i32) {
+    let (w, h) = (img.width() as i32, img.height() as i32);
+    if r < 1 || cx - r - 1 < 0 || cy - r - 1 < 0 || cx + r + 1 >= w || cy + r + 1 >= h {
+        return; // require the target disc (+1px) fully in bounds
+    }
+    let Some((sx, sy)) = best_source(img, cx, cy, r) else {
+        return;
+    };
+    poisson_clone(img, cx, cy, sx, sy, r);
+}
+
+/// The nearby source disc whose surrounding ring best matches the target's ring
+/// (so texture/lighting continues across the patch).
+fn best_source(img: &RgbImage, cx: i32, cy: i32, r: i32) -> Option<(i32, i32)> {
+    let (w, h) = (img.width() as i32, img.height() as i32);
+    let (r0, r1) = (r, (r as f32 * 1.5) as i32);
+    let mut best: Option<(i32, i32)> = None;
+    let mut best_score = f32::MAX;
+    for &mult in &[3.0f32, 5.0, 8.0] {
+        let d = r as f32 * mult;
+        for a in 0..12 {
+            let ang = a as f32 / 12.0 * std::f32::consts::TAU;
+            let sx = cx + (d * ang.cos()) as i32;
+            let sy = cy + (d * ang.sin()) as i32;
+            if sx - r1 < 0 || sy - r1 < 0 || sx + r1 >= w || sy + r1 >= h {
+                continue;
+            }
+            let (mut sum, mut n) = (0.0f32, 0.0f32);
+            for dy in -r1..=r1 {
+                for dx in -r1..=r1 {
+                    let dd = dx * dx + dy * dy;
+                    if dd < r0 * r0 || dd > r1 * r1 {
+                        continue; // annulus around the disc only
+                    }
+                    let tp = img.get_pixel((cx + dx) as u32, (cy + dy) as u32);
+                    let sp = img.get_pixel((sx + dx) as u32, (sy + dy) as u32);
+                    for c in 0..3 {
+                        let e = tp[c] as f32 - sp[c] as f32;
+                        sum += e * e;
+                    }
+                    n += 3.0;
+                }
+            }
+            let score = if n > 0.0 { sum / n } else { f32::MAX };
+            if score < best_score {
+                best_score = score;
+                best = Some((sx, sy));
+            }
+        }
+    }
+    best
+}
+
+/// Poisson seamless clone of the source disc into the target disc: the result
+/// takes the source's gradients (texture) but the target's boundary colours.
+fn poisson_clone(img: &mut RgbImage, cx: i32, cy: i32, sx: i32, sy: i32, r: i32) {
+    let r2 = r * r;
+    let (x0, x1, y0, y1) = (cx - r - 1, cx + r + 1, cy - r - 1, cy + r + 1); // +1 for boundary
+    let bw = (x1 - x0 + 1) as usize;
+    let idx = |x: i32, y: i32| -> usize { ((y - y0) as usize) * bw + (x - x0) as usize };
+    let inside = |x: i32, y: i32| -> bool {
+        let (dx, dy) = (x - cx, y - cy);
+        dx * dx + dy * dy <= r2
+    };
+    let count = (bw * (y1 - y0 + 1) as usize) as usize;
+    let mut tv = vec![[0f32; 3]; count]; // target snapshot (boundary + init)
+    let mut sv = vec![[0f32; 3]; count]; // source snapshot (gradient guidance)
+    for y in y0..=y1 {
+        for x in x0..=x1 {
+            let tp = img.get_pixel(x as u32, y as u32);
+            let sp = img.get_pixel((sx + (x - cx)) as u32, (sy + (y - cy)) as u32);
+            let i = idx(x, y);
+            tv[i] = [tp[0] as f32, tp[1] as f32, tp[2] as f32];
+            sv[i] = [sp[0] as f32, sp[1] as f32, sp[2] as f32];
+        }
+    }
+    let mut f = tv.clone();
+    for _ in 0..POISSON_ITERS {
+        for y in (y0 + 1)..y1 {
+            for x in (x0 + 1)..x1 {
+                if !inside(x, y) {
+                    continue;
+                }
+                let i = idx(x, y);
+                for c in 0..3 {
+                    let mut sum = 0.0;
+                    for (nx, ny) in [(x - 1, y), (x + 1, y), (x, y - 1), (x, y + 1)] {
+                        let ni = idx(nx, ny);
+                        let nv = if inside(nx, ny) { f[ni][c] } else { tv[ni][c] };
+                        sum += nv + (sv[i][c] - sv[ni][c]);
+                    }
+                    f[i][c] = sum / 4.0;
+                }
+            }
+        }
+    }
+    for y in y0..=y1 {
+        for x in x0..=x1 {
+            if !inside(x, y) {
+                continue;
+            }
+            let i = idx(x, y);
+            let px = img.get_pixel_mut(x as u32, y as u32);
+            for c in 0..3 {
+                px[c] = f[i][c].round().clamp(0.0, 255.0) as u8;
+            }
+        }
+    }
+}
+
 // --- public entry points ---------------------------------------------------
 
 /// Color/tone/detail stage (no geometry): white balance → exposure → tone →
@@ -523,6 +687,14 @@ pub fn color(img: &DynamicImage, p: EditParams) -> DynamicImage {
 /// Full pipeline: straighten → color → crop.
 pub fn auto_edit(img: &DynamicImage, p: EditParams) -> DynamicImage {
     crop(&color(&straighten(img, p), p), p)
+}
+
+/// Full pipeline including spatial retouch: straighten → color → heal → crop.
+pub fn render_full(img: &DynamicImage, p: EditParams, retouch: &RetouchOps) -> DynamicImage {
+    let straightened = straighten(img, p);
+    let colored = color(&straightened, p);
+    let retouched = apply_retouch(&colored, retouch);
+    crop(&retouched, p)
 }
 
 /// Auto-exposure only (0..100 strength) — used by tests/diagnostics.
@@ -754,6 +926,27 @@ mod tests {
     fn clarity_runs_and_stays_valid() {
         let out = auto_edit(&gradient(), EditParams { clarity: 80.0, ..params() }).to_rgb8().into_raw();
         assert!(*out.iter().max().unwrap() > *out.iter().min().unwrap());
+    }
+
+    #[test]
+    fn heal_removes_a_spot() {
+        // Flat gray field with a dark blemish disc at the centre.
+        let mut base = RgbImage::from_pixel(80, 80, Rgb([130, 130, 130]));
+        for y in 34..47 {
+            for x in 34..47 {
+                if (x as i32 - 40).pow(2) + (y as i32 - 40).pow(2) <= 30 {
+                    base.put_pixel(x, y, Rgb([40, 40, 40]));
+                }
+            }
+        }
+        let img = DynamicImage::ImageRgb8(base);
+        let before = img.to_rgb8().get_pixel(40, 40)[0];
+        let retouch = RetouchOps {
+            heals: vec![HealStroke { stamps: vec![HealStamp { x: 0.5, y: 0.5, r: 6.0 / 80.0 }] }],
+        };
+        let after = render_full(&img, EditParams::default(), &retouch).to_rgb8().get_pixel(40, 40)[0];
+        assert!(before < 60, "test spot should start dark: {before}");
+        assert!(after > 100, "spot should heal toward the gray field: {before} -> {after}");
     }
 
     // --- auto-only behaviour (unchanged engine) ---

@@ -1009,6 +1009,34 @@ body {
 .h-s  { left: calc(50% - 7px); bottom: -7px; cursor: ns-resize; }
 .h-sw { left: -7px; bottom: -7px; cursor: nesw-resize; }
 .h-w  { left: -7px; top: calc(50% - 7px); cursor: ew-resize; }
+
+/* ---- healing brush overlay ---- */
+.retouch-overlay {
+  position: absolute;
+  inset: 0;
+  cursor: crosshair;
+  touch-action: none;
+}
+.brush-cursor,
+.heal-mark {
+  position: absolute;
+  aspect-ratio: 1;
+  border-radius: 50%;
+  transform: translate(-50%, -50%);
+  pointer-events: none;
+}
+.brush-cursor {
+  border: 1.5px solid rgba(255, 255, 255, 0.92);
+  box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.45);
+}
+.heal-mark {
+  background: rgba(224, 162, 74, 0.35);
+  border: 1px solid var(--accent);
+}
+.brush-slider {
+  width: 150px;
+  accent-color: var(--accent);
+}
 .crop-toolbar {
   display: flex;
   align-items: center;
